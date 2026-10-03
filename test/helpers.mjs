@@ -26,7 +26,9 @@ export function person(base, name) {
   const home = path.join(base, `${name.toLowerCase()}-home`);
   const claude = path.join(home, ".claude");
   fs.mkdirSync(claude, { recursive: true });
-  const env = { ...isolatedGitEnv(base), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: claude, CLAUDE_TEAM_NAME: name, NO_COLOR: "1" };
+  // Background work runs in place (CLAUDE_TEAM_SYNC_INLINE) so the tests see its result at once;
+  // one test in auto.test.mjs exercises the real detached process.
+  const env = { ...isolatedGitEnv(base), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: claude, CLAUDE_TEAM_NAME: name, NO_COLOR: "1", CLAUDE_TEAM_SYNC_INLINE: "1" };
   delete env.CLAUDE_CODE_SESSION_ID;
   return { name, home, claude, env };
 }

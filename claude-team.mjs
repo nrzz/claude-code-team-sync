@@ -16,7 +16,10 @@
 //   TEAM.md                          the team's standing context, edited by anyone
 //
 // Inside Claude Code: a SessionStart hook puts a short digest of the hub in front of every new
-// session, and four skills (/team, /team-share, /team-load, /team-note) work from a session.
+// session, and five skills (/team, /team-share, /team-load, /team-note, /team-auto) work from a
+// session. Sync is automatic: while people work, a detached background process pulls and pushes
+// every few minutes, teammates' new shares and notes arrive as one-line notices, and each person
+// can have their own sessions shared when they end, or kept up to date as they go.
 // claude-team never writes into Claude Code's own session store. A teammate's session is resumed
 // with `claude --resume <file> --fork-session`, so Claude Code imports it as a new session itself.
 //
@@ -30,7 +33,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 const SELF = fileURLToPath(import.meta.url);
 const IS_WIN = process.platform === "win32";
 const REPO_URL = "https://github.com/nrzz/claude-code-team-sync";
@@ -50,7 +53,8 @@ const fail = (message) => { throw new UserError(message); };
 const colorOn = () => !!process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code) => (s) => (colorOn() ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const c = { bold: paint("1"), dim: paint("2"), red: paint("31"), green: paint("32"), yellow: paint("33"), cyan: paint("36"), magenta: paint("35") };
-const say = (...a) => console.log(...a);
+let QUIET = false; // background runs (automatic sync and sharing) print nothing
+const say = (...a) => { if (!QUIET) console.log(...a); };
 
 function readJson(file, fallback = null) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
@@ -448,16 +452,17 @@ export function hubSessions(hub, key) {
 }
 
 const NOTE_LINE = /^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) \[([^\]]+)\] (.*)$/;
+// Newest first. Stamps have minute precision, so within a minute the later line in a file is newer.
 export function readNotes(hub, key) {
   const notes = [];
   for (const f of listDir(path.join(projectHubDir(hub, key), "notes"))) {
     if (!f.isFile() || !f.name.endsWith(".md")) continue;
-    for (const line of readText(path.join(projectHubDir(hub, key), "notes", f.name)).split(/\r?\n/)) {
+    readText(path.join(projectHubDir(hub, key), "notes", f.name)).split(/\r?\n/).forEach((line, order) => {
       const m = line.match(NOTE_LINE);
-      if (m) notes.push({ when: m[1], who: m[2], text: m[3] });
-    }
+      if (m) notes.push({ when: m[1], who: m[2], text: m[3], order });
+    });
   }
-  return notes.sort((a, b) => b.when.localeCompare(a.when));
+  return notes.sort((a, b) => b.when.localeCompare(a.when) || b.order - a.order).map(({ order, ...n }) => n);
 }
 
 const TEAM_TEMPLATE = (project) => `# Team context: ${project}
@@ -780,8 +785,9 @@ function promptTextAny(r) {
   return "";
 }
 
+const AUTO_BRIEF_MARK = "Written automatically by claude-team";
 export function autoBrief(title, sum) {
-  const parts = [`# ${title}`, "", "_Written automatically by claude-team: the author did not write a brief. Run /team-share in the session for a proper one._", ""];
+  const parts = [`# ${title}`, "", `_${AUTO_BRIEF_MARK}: the author did not write a brief. Run /team-share in the session for a proper one._`, ""];
   if (sum.firstPrompt) parts.push("## First request", "", clip(readable(sum.firstPrompt), 900), "");
   if (sum.lastPrompt && sum.lastPrompt !== sum.firstPrompt) parts.push("## Latest request", "", clip(readable(sum.lastPrompt), 900), "");
   if (sum.lastAssistantText) parts.push("## Where it ended (Claude's last message)", "", clip(readable(sum.lastAssistantText), 1600), "");
@@ -803,6 +809,166 @@ export function nextStepOf(brief) {
 // ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// Automatic sync. While people work, a detached process pulls and pushes every few minutes
+// (never holding up a prompt), what teammates add is noted between syncs and shown once per
+// session, and each person may have their own sessions shared without asking.
+// ---------------------------------------------------------------------------------------------
+
+const AUTO_DEFAULTS = { autoSync: true, syncMinutes: 5, notices: "notice", autoShare: "off", shareMinutes: 10 };
+const NOTICE_MODES = ["notice", "context", "off"];
+const SHARE_MODES = ["off", "end", "live"];
+
+// Your setting for this project, then your setting for all projects, then the project's, then the default.
+export function autoSettings(pcfg, ucfg) {
+  const mine = ucfg?.projects?.[pcfg?.project] || {};
+  const pick = (k) => mine[k] ?? ucfg?.[k] ?? pcfg?.[k] ?? AUTO_DEFAULTS[k];
+  const num = (k, min) => Math.max(min, Number(pick(k)) || AUTO_DEFAULTS[k]);
+  return {
+    autoSync: pick("autoSync") !== false,
+    syncMinutes: num("syncMinutes", 1),
+    notices: NOTICE_MODES.includes(pick("notices")) ? pick("notices") : AUTO_DEFAULTS.notices,
+    autoShare: SHARE_MODES.includes(pick("autoShare")) ? pick("autoShare") : AUTO_DEFAULTS.autoShare,
+    shareMinutes: num("shareMinutes", 2),
+  };
+}
+
+const stateDir = (env) => path.join(teamDir(env), "state");
+const shortHash = (s) => createHash("sha1").update(String(s)).digest("hex").slice(0, 8);
+const hubStateFile = (hub, key, env) => path.join(stateDir(env), `${slugify(path.basename(hub.dir || "hub"), 40)}-${shortHash(hub.dir)}--${key}.json`);
+const sessionStateFile = (sid, env) => path.join(stateDir(env), "sessions", `${slugify(sid, 64)}.json`);
+
+function writeJsonAtomic(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
+  fs.renameSync(tmp, file);
+}
+export function readHubState(hub, key, env = process.env) {
+  return readJson(hubStateFile(hub, key, env), null) || { seq: 0, items: [], snapshot: null };
+}
+export const readSessionState = (sid, env = process.env) => (sid ? readJson(sessionStateFile(sid, env), {}) || {} : {});
+export function updateSessionState(sid, patch, env = process.env) {
+  if (!sid) return;
+  writeJsonAtomic(sessionStateFile(sid, env), { ...readSessionState(sid, env), ...patch, touched: new Date().toISOString() });
+}
+
+// What the hub holds for a project, small enough to keep and compare between syncs.
+export function hubSnapshot(hub, key) {
+  const sessions = {};
+  for (const s of hubSessions(hub, key)) sessions[s.meta.id] = { author: s.meta.author, authorSlug: s.meta.authorSlug, title: s.meta.title, sharedAt: s.meta.sharedAt };
+  const notes = {};
+  for (const n of readNotes(hub, key)) { const who = slugify(n.who, 40); notes[who] = (notes[who] || 0) + 1; }
+  return { sessions, notes };
+}
+// What teammates added between two snapshots: new sessions (not updates of ones already there)
+// and new notes. Note files only grow, so a higher count means that many new lines.
+export function diffSnapshots(prev, next, notesNow, me) {
+  if (!prev) return []; // the first snapshot on this machine is the baseline
+  const items = [];
+  for (const [id, s] of Object.entries(next.sessions)) {
+    if (!prev.sessions?.[id] && s.authorSlug !== me) items.push({ kind: "session", id, author: s.author, authorSlug: s.authorSlug, title: s.title });
+  }
+  for (const [who, count] of Object.entries(next.notes)) {
+    const added = count - (prev.notes?.[who] || 0);
+    if (added <= 0 || who === me) continue;
+    for (const n of notesNow.filter((x) => slugify(x.who, 40) === who).slice(0, added).reverse()) {
+      items.push({ kind: "note", author: n.who, authorSlug: who, text: n.text, when: n.when });
+    }
+  }
+  return items;
+}
+export function describeItem(it) {
+  return it.kind === "session"
+    ? `${it.author} shared "${oneLine(it.title, 70)}" (/team-load ${String(it.id).slice(0, 8)})`
+    : `${it.author}: ${oneLine(it.text, 140)}`;
+}
+
+function takeLock(file, staleMs = 120000) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fs.writeFileSync(file, String(process.pid), { flag: "wx" }); return true; } catch (e) {
+      if (e.code !== "EEXIST") return false;
+      try {
+        if (Date.now() - fs.statSync(file).mtimeMs < staleMs) return false; // someone else is syncing
+        fs.rmSync(file, { force: true }); // left by a sync that died
+      } catch { /* gone in the meantime: try again */ }
+    }
+  }
+  return false;
+}
+// Files not committed yet, or commits the remote does not have.
+function hasLocalWork(hub) {
+  if (hubGit(hub, ["status", "--porcelain"]).out.trim()) return true;
+  const ahead = hubGit(hub, ["rev-list", "--count", "FETCH_HEAD..HEAD"]);
+  return !ahead.ok || Number(ahead.out.trim()) > 0;
+}
+
+// One complete sync: pull, push whatever is waiting, and record what teammates added.
+export function syncOnce(root, pcfg, env = process.env, { prompt = false, timeout = 30000 } = {}) {
+  const hub = hubFor(root, pcfg, env);
+  if (!hub.dir) return { ok: false, error: "the hub is not set up on this machine", items: [] };
+  const name = whoAmI(env, root);
+  const file = hubStateFile(hub, pcfg.project, env);
+  const lock = `${file}.lock`;
+  if (!takeLock(lock)) return { ok: true, skipped: true, items: [] };
+  try {
+    const st = readHubState(hub, pcfg.project, env);
+    st.lastSyncStart = new Date().toISOString();
+    writeJsonAtomic(file, st); // so other hooks see a sync under way and do not start another
+    let result = pullHub(hub, { prompt, timeout, author: name });
+    if (result.ok && hub.type !== "folder" && hasLocalWork(hub)) {
+      const pub = publishHub(hub, `sync: ${name}`, { prompt, author: name });
+      if (!pub.ok) result = pub;
+    }
+    const snap = hubSnapshot(hub, pcfg.project);
+    const items = diffSnapshots(st.snapshot, snap, readNotes(hub, pcfg.project), slugify(name, 40));
+    const at = new Date().toISOString();
+    for (const it of items) st.items.push({ ...it, seq: ++st.seq, at });
+    st.items = st.items.slice(-60);
+    st.snapshot = snap;
+    st.lastSyncEnd = at;
+    st.lastResult = result.ok ? "ok" : result.offline ? "offline" : "error";
+    st.lastError = result.ok ? "" : oneLine(result.error, 300);
+    writeJsonAtomic(file, st);
+    return { ...result, items };
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+function autoLog(env, line) {
+  try {
+    const file = path.join(teamDir(env), "logs", "auto.log");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (exists(file) && fs.statSync(file).size > 256 * 1024) fs.writeFileSync(file, readTail(file, 64 * 1024));
+    fs.appendFileSync(file, `${new Date().toISOString()} ${line}\n`);
+  } catch { /* logging must never fail the work it describes */ }
+}
+
+// Background work runs as its own detached process, so a hook returns at once. Setting
+// CLAUDE_TEAM_SYNC_INLINE=1 runs it in place instead (the tests do).
+function runDetached(args, cwd, env) {
+  try {
+    const child = spawn(process.execPath, [SELF, ...args], { cwd, env: { ...env, CLAUDE_TEAM_BACKGROUND: "1" }, detached: true, stdio: "ignore", windowsHide: true });
+    child.on("error", () => {});
+    child.unref();
+  } catch { /* the next prompt tries again */ }
+}
+async function quietly(env, label, fn) {
+  const was = QUIET;
+  QUIET = true;
+  try { return await fn(); } catch (e) { autoLog(env, `${label}: ${e?.message || e}`); return 1; } finally { QUIET = was; }
+}
+async function kickSync(root, pcfg, env) {
+  if (env.CLAUDE_TEAM_SYNC_INLINE === "1") return quietly(env, "sync", () => syncOnce(root, pcfg, env));
+  runDetached(["sync", "--background"], root, env);
+}
+async function kickShare(root, sid, env) {
+  if (env.CLAUDE_TEAM_SYNC_INLINE === "1") return quietly(env, `share ${sid.slice(0, 8)}`, () => cmdShare(parseArgs([sid, "--auto"]), { cwd: root, env }));
+  runDetached(["share", sid, "--auto"], root, env);
+}
 
 function requireProject(cwd, env) {
   const root = findProjectRoot(cwd);
@@ -881,7 +1047,7 @@ async function cmdInit(args, ctx) {
     hubCfg = { type: "folder", label: args.label || path.basename(path.resolve(hubArg)) };
   }
   const project = slugify(args.project || repoName(origin) || path.basename(root), 60);
-  const pcfg = { version: 1, project, hub: hubCfg };
+  const pcfg = { version: 1, project, hub: hubCfg, ...(args["no-auto"] ? { autoSync: false } : {}) };
   const name = args.name || whoAmI(env, root);
   const ucfg = loadUserConfig(env);
   ucfg.name = name;
@@ -890,7 +1056,7 @@ async function cmdInit(args, ctx) {
 
   writeJson(path.join(root, PROJECT_CONFIG), pcfg);
   installIntoProject(root);
-  const settingsNote = mergeProjectSettings(root);
+  const settingsNote = mergeProjectSettings(root, { auto: pcfg.autoSync !== false });
 
   const hub = hubFor(root, pcfg, env);
   const ready = ensureHub(hub, { prompt: !!process.stdin.isTTY, author: name });
@@ -914,6 +1080,7 @@ async function cmdInit(args, ctx) {
   if (hubCfg.type === "folder") say(`  2. Each teammate pulls, then once: ${c.cyan(`node .claude/team-sync/claude-team.mjs join --folder "<their path to ${hubCfg.label}>"`)}`);
   else say("  2. Teammates just pull. Their next Claude Code session in this project connects to the hub by itself.");
   say(`  3. In Claude Code: ${c.cyan("/team-share")} shares the session you are in, ${c.cyan("/team-load <id or topic>")} loads a teammate's, ${c.cyan("/team-note <text>")} adds a team note, ${c.cyan("/team")} shows what is new.`);
+  if (pcfg.autoSync !== false) say(`  Sync is automatic while you work. To have your own sessions shared too: ${c.cyan("/team-auto end")} (when they end) or ${c.cyan("/team-auto live")} (as you go).`);
   return 0;
 }
 
@@ -944,6 +1111,7 @@ async function cmdJoin(args, ctx) {
 
 async function cmdShare(args, ctx) {
   const { env } = ctx;
+  const auto = !!args.auto; // run by a hook: quiet, and only when the person turned automatic sharing on
   const { root, pcfg, hub } = requireProject(ctx.cwd, env);
   const author = whoAmI(env, root);
   let ref = args._[0];
@@ -964,6 +1132,7 @@ async function cmdShare(args, ctx) {
   if (files.length > 1) fail(`More than one session starts with ${ref}; give more of the id.`);
   const file = files[0];
   const sessionId = path.basename(file, ".jsonl");
+  if (auto && readSessionState(sessionId, env).skip) return 0; // the person kept this one private
   const info = sessionInfo(file);
 
   const redactCounts = {};
@@ -981,13 +1150,26 @@ async function cmdShare(args, ctx) {
   const { records, bad } = parseTranscript(fs.readFileSync(file, "utf8"));
   const { records: clean, stats } = sanitizeRecords(records, { mapString, keepThinking: !!args["keep-thinking"], keepImages: !!args["keep-images"] });
   const sum = summarize(clean);
-  const title = oneLine(args.title || info.title, 120);
+  if (auto && sum.prompts < 2) return 0; // too small to share without being asked
   const sharedAt = new Date().toISOString();
+  const interactive = !!process.stdin.isTTY && !auto;
+
+  // The hub first, so a re-share keeps what the author already wrote (a dry run uses the local copy).
+  let ready = { ok: true };
+  if (!args["dry-run"]) {
+    ready = pullHub(hub, { prompt: interactive, author });
+    if (!ready.ok && !ready.offline) fail(`Hub problem: ${ready.error}`);
+  }
+  const existing = hubSessions(hub, pcfg.project).find((s) => s.meta.id === sessionId);
+  const title = oneLine(args.title || (existing && auto ? existing.meta.title : "") || info.title, 120);
 
   let brief = "";
   if (args.brief === "-" || args.brief === true) brief = readStdin();
   else if (args.brief) brief = readText(path.resolve(ctx.cwd, args.brief));
-  brief = brief.trim() ? mapString(brief.trim()) + "\n" : autoBrief(title, sum);
+  const keptBrief = existing ? readText(path.join(existing.dir, "brief.md")) : "";
+  if (brief.trim()) brief = mapString(brief.trim()) + "\n";
+  else if (keptBrief.trim() && !keptBrief.includes(AUTO_BRIEF_MARK)) brief = keptBrief; // written by a person: keep it
+  else brief = autoBrief(title, sum);
   const transcript = renderTranscript(clean, { title, author, sharedAt, branch: sum.branch, prompts: sum.prompts, toolCalls: sum.toolCalls });
   const raw = args["no-raw"] ? null : zlib.gzipSync(Buffer.from(clean.map((r) => JSON.stringify(r)).join("\n") + "\n"), { level: 9 });
   if (raw && raw.length > 50 * 1024 * 1024 && !args.force) fail(`The session is ${kb(raw.length)} even compressed. Share it with --no-raw (brief and transcript only), or --force.`);
@@ -1007,7 +1189,8 @@ async function cmdShare(args, ctx) {
 
   const meta = {
     schema: 1, id: sessionId, title, author, authorSlug: slugify(author, 40), project: pcfg.project,
-    sharedAt, started: sum.started || info.started, updated: sum.updated || info.updated,
+    sharedAt, firstShared: existing?.meta.firstShared || existing?.meta.sharedAt || sharedAt, auto,
+    started: sum.started || info.started, updated: sum.updated || info.updated,
     branch: sum.branch || info.branch, claudeVersion: sum.version, models: sum.models,
     summary: oneLine(sum.firstPrompt ? readable(sum.firstPrompt) : title, 200), next: nextStepOf(brief),
     counts: { prompts: sum.prompts, assistantMessages: sum.assistantMessages, toolCalls: sum.toolCalls, records: clean.length },
@@ -1031,13 +1214,11 @@ async function cmdShare(args, ctx) {
     return 0;
   }
 
-  const ready = pullHub(hub, { prompt: !!process.stdin.isTTY, author });
-  if (!ready.ok && !ready.offline) fail(`Hub problem: ${ready.error}`);
-  const existing = hubSessions(hub, pcfg.project).find((s) => s.meta.id === sessionId);
   const dir = existing ? existing.dir : path.join(projectHubDir(hub, pcfg.project), "sessions", `${sharedAt.slice(0, 10)}_${meta.authorSlug}_${sessionId.slice(0, 8)}`);
   if (existing) fs.rmSync(dir, { recursive: true, force: true });
   writePackage(dir, { meta, brief, transcript, raw, toolResults });
-  const pub = publishHub(hub, `share: ${author}: ${title}`, { prompt: !!process.stdin.isTTY, author });
+  const pub = publishHub(hub, `${auto ? "auto-share" : "share"}: ${author}: ${title}`, { prompt: interactive, author });
+  if (auto) autoLog(env, `share ${sessionId.slice(0, 8)} "${title}": ${pub.ok && ready.ok ? "shared" : `saved locally (${pub.error || ready.error})`}`);
 
   say(c.green("✓"), `${existing ? "Updated" : "Shared"} "${title}" (${sessionId.slice(0, 8)}) with the team${hub.type === "folder" ? ` in ${hub.dir}` : ""}.`);
   report();
@@ -1211,12 +1392,85 @@ async function cmdNotes(args, ctx) {
 async function cmdSync(args, ctx) {
   const { env } = ctx;
   const { root, pcfg, hub } = requireProject(ctx.cwd, env);
-  const author = whoAmI(env, root);
-  const pulled = pullHub(hub, { prompt: !!process.stdin.isTTY, author });
-  if (!pulled.ok) fail(`Could not sync: ${pulled.error}`);
-  const pub = publishHub(hub, `sync: ${author}`, { prompt: !!process.stdin.isTTY, author });
-  if (!pub.ok) fail(`Pulled, but could not push: ${pub.error}`);
+  if (args.background) { // started by a hook: quiet, and a failure only goes to the log
+    const r = syncOnce(root, pcfg, env, { timeout: 60000 });
+    if (!r.ok) autoLog(env, `sync ${pcfg.project}: ${r.error}`);
+    return 0;
+  }
+  let r = syncOnce(root, pcfg, env, { prompt: !!process.stdin.isTTY, timeout: 60000 });
+  for (let i = 0; r.skipped && i < 20; i++) { // a background sync is running: wait for it, then go
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    r = syncOnce(root, pcfg, env, { prompt: !!process.stdin.isTTY, timeout: 60000 });
+  }
+  if (!r.ok) fail(`Could not sync: ${r.error}`);
   say(c.green("✓"), `In sync with ${hub.label}: ${plural(hubSessions(hub, pcfg.project).length, "shared session")}, ${plural(readNotes(hub, pcfg.project).length, "note")}.`);
+  for (const it of r.items || []) say("  " + describeItem(it));
+  return 0;
+}
+
+// Keeps a hub in sync from a terminal tab, also while Claude Code is closed, and prints news.
+async function cmdWatch(args, ctx) {
+  const { env } = ctx;
+  const { root, pcfg, hub } = requireProject(ctx.cwd, env);
+  const every = Math.max(0.25, Number(args.every) || 2);
+  if (!args.once) say(c.bold(`Watching the team hub for ${pcfg.project}`), c.dim(`(${hub.label}, every ${every} min; ctrl+c stops)`));
+  let wasOffline = null;
+  for (;;) {
+    const r = syncOnce(root, pcfg, env, { timeout: 60000 });
+    const now = c.dim(localStamp().slice(11));
+    if (!r.skipped) {
+      if (!r.ok && wasOffline !== true) say(now, c.yellow(`hub unreachable: ${oneLine(r.error, 100)}`));
+      if (r.ok && wasOffline !== false) say(now, c.green("in sync"));
+      wasOffline = !r.ok;
+    }
+    for (const it of r.items || []) say(now, describeItem(it));
+    if (args.once) return 0;
+    await new Promise((resolve) => setTimeout(resolve, every * 60000));
+  }
+}
+
+async function cmdAuto(args, ctx) {
+  const { env } = ctx;
+  const { root, pcfg, hub } = requireProject(ctx.cwd, env);
+  const ucfg = loadUserConfig(env);
+  const scope = args.global ? ucfg : (((ucfg.projects ||= {})[pcfg.project]) ||= {});
+  const [what, value] = args._;
+  const sid = (typeof args.session === "string" && !args.session.includes("${") ? args.session : "") || env.CLAUDE_CODE_SESSION_ID || "";
+  const where = args.global ? "for all your projects" : `for you in ${pcfg.project}`;
+  switch (what) {
+    case undefined: case "status": break;
+    case "live": case "end": case "off": scope.autoShare = what; break;
+    case "share":
+      if (!SHARE_MODES.includes(value)) fail(`auto share takes ${SHARE_MODES.join(", ")}`);
+      scope.autoShare = value; break;
+    case "sync":
+      if (!["on", "off"].includes(value)) fail("auto sync takes on or off");
+      scope.autoSync = value === "on"; break;
+    case "notices":
+      if (!NOTICE_MODES.includes(value)) fail(`auto notices takes ${NOTICE_MODES.join(", ")}`);
+      scope.notices = value; break;
+    case "every":
+      if (!(Number(value) >= 1)) fail("auto every takes a number of minutes, 1 or more");
+      scope.syncMinutes = Number(value); break;
+    case "skip": case "unskip":
+      if (!sid) fail("Which session? Pass --session <id>. In Claude Code, /team-auto skip does it for the session you are in.");
+      updateSessionState(sid, { skip: what === "skip" }, env);
+      say(c.green("✓"), what === "skip" ? `Session ${sid.slice(0, 8)} will not be shared automatically.` : `Session ${sid.slice(0, 8)} follows your automatic sharing setting again.`);
+      return 0;
+    default:
+      fail(`Unknown setting "${what}". Try: auto live | auto end | auto off | auto sync on|off | auto notices notice|context|off | auto every <minutes> | auto skip`);
+  }
+  if (what && what !== "status") saveUserConfig(ucfg, env);
+  const a = autoSettings(pcfg, loadUserConfig(env));
+  const st = hub.dir ? readHubState(hub, pcfg.project, env) : {};
+  const last = st.lastSyncEnd ? `last ${ago(st.lastSyncEnd)}${st.lastResult && st.lastResult !== "ok" ? `, ${st.lastResult}: ${oneLine(st.lastError, 60)}` : ""}` : "not synced on this machine yet";
+  const share = { off: "off: you share with /team-share", end: "each session is shared when it ends", live: `your sessions update in the hub every ${a.shareMinutes} min while you work, and when they end` }[a.autoShare];
+  const notices = { notice: "one line for you, no tokens", context: "one line for you, and Claude is told (a few tokens)", off: "off" }[a.notices];
+  if (what && what !== "status") say(c.green("✓"), `Saved ${where}.`);
+  say(c.bold(`Automatic sync for ${pcfg.project}`), c.dim(`(you are ${whoAmI(env, root)})`));
+  say(`  Sync:     ${a.autoSync ? `on, every ${a.syncMinutes} min while you work (${last})` : "off: the hub syncs at session start and when you share or note"}`);
+  say(`  Notices:  ${notices}`);
+  say(`  Sharing:  ${share}`);
   return 0;
 }
 
@@ -1263,7 +1517,7 @@ async function cmdStatus(args, ctx) {
   const { env } = ctx;
   const { root, pcfg, hub } = requireProject(ctx.cwd, env);
   const forContext = !!args["for-context"];
-  const sync = pullHub(hub, { timeout: forContext ? 10000 : 30000 });
+  const sync = forContext ? pullHub(hub, { timeout: 10000 }) : syncOnce(root, pcfg, env, { timeout: 30000 });
   const me = whoAmI(env, root);
   if (forContext) {
     const d = buildDigest(hub, pcfg.project, { maxChars: 6000, me: slugify(me, 40) });
@@ -1274,13 +1528,15 @@ async function cmdStatus(args, ctx) {
   const vendored = path.join(root, VENDOR_DIR, VENDOR_FILE);
   const vendoredVersion = (readText(vendored).match(/export const VERSION = "([^"]+)"/) || [])[1];
   const settings = readJson(path.join(root, ".claude", "settings.json"), {});
-  const hooked = JSON.stringify(settings?.hooks?.SessionStart || []).includes("claude-team.mjs");
+  const hooked = (event) => JSON.stringify(settings?.hooks?.[event] || []).includes("claude-team.mjs");
+  const a = autoSettings(pcfg, loadUserConfig(env));
   say(c.bold(`claude-team ${VERSION}`), c.dim(`· project ${pcfg.project} · you are ${me}`));
   say(`  Hub:       ${hub.label}${hub.dir ? c.dim(` (${hub.dir})`) : ""}`);
   say(`  Synced:    ${sync.ok ? c.green("yes") : c.yellow(`no: ${sync.error}`)}`);
   say(`  Shared:    ${plural(hubSessions(hub, pcfg.project).length, "session")}, ${plural(readNotes(hub, pcfg.project).length, "note")}`);
-  say(`  Hook:      ${hooked ? c.green("session-start digest on") : c.yellow("not in .claude/settings.json (run: claude-team update)")}`);
-  say(`  Skills:    ${["team", "team-share", "team-load", "team-note"].filter((s) => exists(path.join(root, ".claude", "skills", s, "SKILL.md"))).map((s) => "/" + s).join(" ") || c.yellow("missing (run: claude-team update)")}`);
+  say(`  Hooks:     ${hooked("SessionStart") ? c.green("session-start digest on") : c.yellow("not in .claude/settings.json (run: claude-team update)")}${hooked("UserPromptSubmit") ? c.green(", automatic sync on") : ""}`);
+  say(`  Auto:      ${a.autoSync ? `sync every ${a.syncMinutes} min` : "sync off"}, notices ${a.notices}, sharing ${a.autoShare} ${c.dim("(claude-team auto to change)")}`);
+  say(`  Skills:    ${["team", "team-share", "team-load", "team-note", "team-auto"].filter((s) => exists(path.join(root, ".claude", "skills", s, "SKILL.md"))).map((s) => "/" + s).join(" ") || c.yellow("missing (run: claude-team update)")}`);
   say(`  Vendored:  ${vendoredVersion ? `claude-team ${vendoredVersion}` : c.yellow("missing")} in ${path.join(VENDOR_DIR, VENDOR_FILE)}`);
   return 0;
 }
@@ -1289,51 +1545,129 @@ async function cmdUpdate(args, ctx) {
   const root = findProjectRoot(ctx.cwd);
   if (!loadProjectConfig(root)) fail("No team hub here yet; run claude-team init.");
   installIntoProject(root);
-  const note = mergeProjectSettings(root);
-  say(c.green("✓"), `Updated the vendored claude-team (${VERSION}), the skills and the session-start hook in ${root}. Commit the changes.`);
+  const note = mergeProjectSettings(root, { auto: loadProjectConfig(root).autoSync !== false });
+  say(c.green("✓"), `Updated the vendored claude-team (${VERSION}), the skills and the hooks in ${root}. Commit the changes.`);
   if (note) say(c.yellow("!"), note);
   return 0;
 }
 
-// The SessionStart hook: sync quickly, then put a short digest in front of the new session.
-// It never blocks a session: any failure ends silently with exit code 0.
+// The hooks Claude Code runs (see mergeHookSettings). Each one returns quickly and never blocks
+// or breaks a session: any failure ends silently with exit code 0.
+//   session-start  digest of the hub (synced first when the local copy is old)
+//   prompt         background sync every few minutes; notices of what teammates added
+//   stop           with automatic sharing "live": refresh this session in the hub every few minutes
+//   session-end    with automatic sharing on: share the finished session; otherwise push what waits
 async function cmdHook(args, ctx) {
-  const { env } = ctx;
-  if (args._[0] !== "session-start") return 0;
+  const handlers = { "session-start": hookSessionStart, prompt: hookPrompt, stop: hookStop, "session-end": hookSessionEnd };
+  const handler = handlers[args._[0]];
+  if (!handler) return 0;
   try {
     let input = {};
     try { input = JSON.parse(readStdin() || "{}"); } catch { input = {}; }
-    if (input.source && !["startup", "clear"].includes(input.source)) return 0; // already in context
-    const root = findProjectRoot(input.cwd || ctx.cwd);
-    const pcfg = loadProjectConfig(root);
-    if (!pcfg || pcfg.digest === "off") return 0;
-    const ucfg = loadUserConfig(env);
-    if (ucfg.digest === "off") return 0;
-    const hub = hubFor(root, pcfg, env);
-    const out = {};
-    if (!hub.dir) {
-      out.systemMessage = hub.type === "folder"
-        ? `Team hub: run once in this project: node .claude/team-sync/claude-team.mjs join --folder "<your path to ${pcfg.hub?.label || "the shared folder"}>"`
-        : "Team hub: this project has no git remote for the hub branch.";
-      process.stdout.write(JSON.stringify(out));
-      return 0;
-    }
-    const name = whoAmI(env, root);
-    const me = slugify(name, 40);
-    const sync = pullHub(hub, { timeout: Number(env.CLAUDE_TEAM_HOOK_TIMEOUT_MS) || 8000, author: name });
+    await handler(input && typeof input === "object" ? input : {}, ctx);
+  } catch { /* a hook must never break a session */ }
+  return 0;
+}
+
+// Project, settings and hub for a hook, with the hub and your name cached per session so the
+// hooks that run on every prompt do not call git.
+function hookContext(input, ctx) {
+  const { env } = ctx;
+  const sid = String(input.session_id || "");
+  const root = findProjectRoot(input.cwd || ctx.cwd);
+  const pcfg = loadProjectConfig(root);
+  if (!pcfg || !pcfg.project) return null;
+  const ucfg = loadUserConfig(env);
+  const ss = readSessionState(sid, env);
+  const cached = ss.root === root && ss.hub?.dir && ss.name;
+  const hub = cached ? ss.hub : hubFor(root, pcfg, env);
+  const name = cached ? ss.name : whoAmI(env, root);
+  if (sid && !cached && hub.dir) updateSessionState(sid, { root, hub, name }, env);
+  return { root, pcfg, ucfg, hub, name, me: slugify(name, 40), auto: autoSettings(pcfg, ucfg), sid, ss };
+}
+// CLAUDE_TEAM_SYNC_MINUTES and CLAUDE_TEAM_SHARE_MINUTES override the intervals (0 means every time).
+const minutes = (override, fallback) => (override !== undefined && override !== "" && Number(override) >= 0 ? Number(override) : fallback);
+const emit = (out) => { if (Object.keys(out).length) process.stdout.write(JSON.stringify(out)); };
+
+async function hookSessionStart(input, ctx) {
+  const { env } = ctx;
+  if (input.source && !["startup", "clear"].includes(input.source)) return; // resume, compact: already in context
+  const h = hookContext(input, ctx);
+  if (!h) return;
+  const { root, pcfg, ucfg, hub, me, auto, sid } = h;
+  if (!hub.dir) {
+    emit({ systemMessage: hub.type === "folder"
+      ? `Team hub: run once in this project: node .claude/team-sync/claude-team.mjs join --folder "<your path to ${pcfg.hub?.label || "the shared folder"}>"`
+      : "Team hub: this project has no git remote for the hub branch." });
+    return;
+  }
+  // A copy synced in the last half hour is used at once and refreshed in the background;
+  // an older one is synced first, for at most a few seconds.
+  const before = readHubState(hub, pcfg.project, env);
+  const age = before.lastSyncEnd ? Date.now() - Date.parse(before.lastSyncEnd) : Infinity;
+  let sync = { ok: true };
+  if (age > 30 * 60000 || !auto.autoSync) sync = syncOnce(root, pcfg, env, { timeout: Number(env.CLAUDE_TEAM_HOOK_TIMEOUT_MS) || 8000 });
+  else await kickSync(root, pcfg, env);
+  updateSessionState(sid, { seen: readHubState(hub, pcfg.project, env).seq }, env); // the digest covers what is here now
+
+  const out = {};
+  if (pcfg.digest !== "off" && ucfg.digest !== "off") {
     const seen = ucfg.lastSeen?.[pcfg.project] || null;
     const d = buildDigest(hub, pcfg.project, { maxChars: Number(pcfg.digestChars) || 3000, seen, me });
-    ucfg.lastSeen = { ...(ucfg.lastSeen || {}), [pcfg.project]: { at: new Date().toISOString(), notes: d.notesFromOthers } };
-    saveUserConfig(ucfg, env);
+    const fresh = loadUserConfig(env); // saved again in full, so another hook's write is not lost
+    fresh.lastSeen = { ...(fresh.lastSeen || {}), [pcfg.project]: { at: new Date().toISOString(), notes: d.notesFromOthers } };
+    saveUserConfig(fresh, env);
     if (d.text) out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: d.text };
     const news = [];
-    if (d.newSessions) news.push(`${d.newSessions} new shared session${d.newSessions > 1 ? "s" : ""}`);
-    if (d.newNotes) news.push(`${d.newNotes} new note${d.newNotes > 1 ? "s" : ""}`);
+    if (d.newSessions) news.push(plural(d.newSessions, "new shared session"));
+    if (d.newNotes) news.push(plural(d.newNotes, "new note"));
     if (news.length) out.systemMessage = `Team hub: ${news.join(" and ")} since your last session. /team shows them.`;
-    else if (!sync.ok && sync.offline) out.systemMessage = `Team hub offline (${oneLine(sync.error, 80)}); using the copy on this machine.`;
-    if (Object.keys(out).length) process.stdout.write(JSON.stringify(out));
-  } catch { /* a hook must never break a session start */ }
-  return 0;
+  }
+  if (!out.systemMessage && !sync.ok && sync.offline) out.systemMessage = `Team hub offline (${oneLine(sync.error, 80)}); using the copy on this machine.`;
+  emit(out);
+}
+
+async function hookPrompt(input, ctx) {
+  const { env } = ctx;
+  const h = hookContext(input, ctx);
+  if (!h || !h.hub.dir) return;
+  const { root, pcfg, hub, me, auto, sid } = h;
+  if (auto.autoSync) {
+    const started = Date.parse(readHubState(hub, pcfg.project, env).lastSyncStart || 0) || 0;
+    if (Date.now() - started >= minutes(env.CLAUDE_TEAM_SYNC_MINUTES, auto.syncMinutes) * 60000) await kickSync(root, pcfg, env);
+  }
+  if (auto.notices === "off" || !sid) return;
+  const st = readHubState(hub, pcfg.project, env);
+  const seen = readSessionState(sid, env).seen;
+  updateSessionState(sid, { seen: st.seq }, env);
+  if (!Number.isFinite(seen)) return; // a session older than the hooks: start counting from here
+  const news = st.items.filter((it) => it.seq > seen && it.authorSlug !== me);
+  if (!news.length) return;
+  const lines = news.slice(-6).map(describeItem);
+  const out = { systemMessage: `Team: ${lines.join(" · ")}` };
+  if (auto.notices === "context") {
+    out.hookSpecificOutput = {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: `Team update (claude-code-team-sync) since this session started:\n${lines.map((l) => `- ${l}`).join("\n")}\nMention it only where it matters for the current task.`,
+    };
+  }
+  emit(out);
+}
+
+async function hookStop(input, ctx) {
+  const h = hookContext(input, ctx);
+  if (!h || !h.sid || !h.hub.dir || h.auto.autoShare !== "live" || h.ss.skip) return;
+  const last = Date.parse(h.ss.lastAutoShare || 0) || 0;
+  if (Date.now() - last < minutes(ctx.env.CLAUDE_TEAM_SHARE_MINUTES, h.auto.shareMinutes) * 60000) return;
+  updateSessionState(h.sid, { lastAutoShare: new Date().toISOString() }, ctx.env);
+  await kickShare(h.root, h.sid, ctx.env);
+}
+
+async function hookSessionEnd(input, ctx) {
+  const h = hookContext(input, ctx);
+  if (!h || !h.hub.dir) return;
+  if (h.sid && h.auto.autoShare !== "off" && !h.ss.skip) await kickShare(h.root, h.sid, ctx.env); // a share pushes too
+  else if (h.auto.autoSync) await kickSync(h.root, h.pcfg, ctx.env);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1393,6 +1727,18 @@ Save this as a team note: $ARGUMENTS
 
 Run \`${RUN} note --stdin\` and pass the note text on stdin exactly as written above (a quoted heredoc such as <<'NOTE' in bash, or a here-string piped in PowerShell), so quotes and symbols in it survive. If the note is empty, ask what to save instead. Reply with one line quoting what was saved.
 `,
+  "team-auto": `---
+name: team-auto
+description: Set automatic team sharing for yourself (claude-code-team-sync), or keep this session out of it.
+disable-model-invocation: true
+argument-hint: [live | end | off | skip | unskip | status]
+allowed-tools: Bash(node *)
+---
+
+!\`${RUN} auto $ARGUMENTS --session \${CLAUDE_SESSION_ID}\`
+
+Reply in one or two lines with what is now set, from the output above: live shares your sessions as you work, end shares each one when it ends, off leaves sharing to /team-share, and skip keeps this session out.
+`,
 };
 
 const VENDOR_README = `# claude-team (vendored)
@@ -1400,8 +1746,8 @@ const VENDOR_README = `# claude-team (vendored)
 This folder belongs to [claude-code-team-sync](${REPO_URL}). It is committed with the project so every teammate gets the team hub without installing anything:
 
 - \`claude-team.mjs\` is the whole tool (Node 18+, no dependencies). \`node .claude/team-sync/claude-team.mjs help\` lists its commands.
-- \`.claude/settings.json\` runs it at session start to show the team digest.
-- \`.claude/skills/team*/\` are the \`/team\`, \`/team-share\`, \`/team-load\` and \`/team-note\` commands.
+- \`.claude/settings.json\` runs it from four hooks: the team digest at session start, and automatic sync while you work (a background pull and push every few minutes, notices of what teammates add, and your own sessions shared if you turned that on).
+- \`.claude/skills/team*/\` are the \`/team\`, \`/team-share\`, \`/team-load\`, \`/team-note\` and \`/team-auto\` commands.
 
 Update it from the project root with \`npx -y github:nrzz/claude-code-team-sync update\`, then commit.
 `;
@@ -1416,27 +1762,39 @@ function installIntoProject(root) {
 }
 
 const isOurHook = (h) => JSON.stringify(h || {}).includes("team-sync/claude-team.mjs");
-export function mergeHookSettings(settings) {
+// [event, matcher, our hook name, timeout in seconds, needed without automatic sync]
+const HOOK_EVENTS = [
+  ["SessionStart", "startup|clear", "session-start", 30, true],
+  ["UserPromptSubmit", null, "prompt", 10, false],
+  ["Stop", null, "stop", 10, false],
+  ["SessionEnd", null, "session-end", 10, false],
+];
+export function mergeHookSettings(settings, { auto = true } = {}) {
   const s = settings && typeof settings === "object" ? settings : {};
   s.hooks = s.hooks && typeof s.hooks === "object" ? s.hooks : {};
-  const groups = Array.isArray(s.hooks.SessionStart) ? s.hooks.SessionStart : [];
-  const kept = groups
-    .map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !isOurHook(h)) }))
-    .filter((g) => g.hooks.length);
-  kept.push({ matcher: "startup|clear", hooks: [{ type: "command", command: "node", args: [HOOK_SCRIPT, "hook", "session-start"], timeout: 30 }] });
-  s.hooks.SessionStart = kept;
+  for (const [event, matcher, name, timeout, always] of HOOK_EVENTS) {
+    const groups = Array.isArray(s.hooks[event]) ? s.hooks[event] : [];
+    const kept = groups
+      .map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !isOurHook(h)) }))
+      .filter((g) => g.hooks.length);
+    if (always || auto) {
+      kept.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command: "node", args: [HOOK_SCRIPT, "hook", name], timeout }] });
+    }
+    if (kept.length) s.hooks[event] = kept;
+    else delete s.hooks[event];
+  }
   return s;
 }
-function mergeProjectSettings(root) {
+function mergeProjectSettings(root, { auto = true } = {}) {
   const file = path.join(root, ".claude", "settings.json");
   let settings = {};
   if (exists(file)) {
     settings = readJson(file, undefined);
     if (settings === undefined) {
-      return `.claude/settings.json is not valid JSON, so it was left alone. Add this under "hooks" by hand:\n${JSON.stringify(mergeHookSettings({}).hooks, null, 2)}`;
+      return `.claude/settings.json is not valid JSON, so it was left alone. Add this under "hooks" by hand:\n${JSON.stringify(mergeHookSettings({}, { auto }).hooks, null, 2)}`;
     }
   }
-  writeJson(file, mergeHookSettings(settings));
+  writeJson(file, mergeHookSettings(settings, { auto }));
   return "";
 }
 
@@ -1444,7 +1802,7 @@ function mergeProjectSettings(root) {
 // Command line
 // ---------------------------------------------------------------------------------------------
 
-const BOOLEAN_FLAGS = new Set(["yes", "force", "last", "dry-run", "no-raw", "keep-thinking", "keep-images", "launch", "for-context", "full", "stdin", "help", "version", "path"]);
+const BOOLEAN_FLAGS = new Set(["yes", "force", "last", "dry-run", "no-raw", "keep-thinking", "keep-images", "launch", "for-context", "full", "stdin", "help", "version", "path", "auto", "background", "once", "global", "no-auto"]);
 export function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -1479,6 +1837,14 @@ ${c.bold("Share and pick up")}
   claude-team show <id|words> [--for-context] [--full]
   claude-team resume <id|words> [--launch] [--to <dir>]   continue a teammate's session
 
+${c.bold("Automatic sync")} (on by default: a background sync every few minutes while you work)
+  claude-team auto                         what is set for you
+  claude-team auto live|end|off            share your sessions as you go, when they end, or only by hand
+  claude-team auto sync on|off             background sync for you
+  claude-team auto notices notice|context|off   how teammates' news reaches you
+  claude-team auto every <minutes>         how often to sync (default 5)
+  claude-team watch [--every <minutes>]    keep syncing from a terminal tab, with news
+
 ${c.bold("Team context")}
   claude-team note "<text>"                add a dated team note
   claude-team notes                        read the newest notes
@@ -1486,13 +1852,13 @@ ${c.bold("Team context")}
   claude-team sync                         pull and push the hub now
   claude-team status
 
-In Claude Code: /team, /team-share, /team-load <id or topic>, /team-note <text>.
+In Claude Code: /team, /team-share, /team-load <id or topic>, /team-note <text>, /team-auto <live|end|off|skip>.
 ${REPO_URL}`;
 
 const COMMANDS = {
   init: cmdInit, join: cmdJoin, share: cmdShare, sessions: cmdSessions, list: cmdList, ls: cmdList,
   search: cmdSearch, show: cmdShow, resume: cmdResume, note: cmdNote, notes: cmdNotes, sync: cmdSync,
-  context: cmdContext, status: cmdStatus, update: cmdUpdate, hook: cmdHook,
+  context: cmdContext, status: cmdStatus, update: cmdUpdate, hook: cmdHook, auto: cmdAuto, watch: cmdWatch,
 };
 
 export async function main(argv, { cwd = process.cwd(), env = process.env } = {}) {
@@ -1503,6 +1869,7 @@ export async function main(argv, { cwd = process.cwd(), env = process.env } = {}
   const command = COMMANDS[name];
   if (!command) { console.error(c.red("✗"), `Unknown command "${name}".`); say(HELP); return 1; }
   if (args.help) { say(HELP); return 0; }
+  if (env.CLAUDE_TEAM_BACKGROUND === "1") QUIET = true;
   return command(args, { cwd, env });
 }
 
@@ -1513,6 +1880,7 @@ if (isMain) {
   main(process.argv.slice(2)).then(
     (code) => { process.exitCode = code ?? 0; },
     (err) => {
+      if (process.env.CLAUDE_TEAM_BACKGROUND === "1") autoLog(process.env, `${process.argv.slice(2).join(" ")}: ${err?.message || err}`);
       if (err instanceof UserError) { console.error(c.red("✗"), err.message); process.exitCode = 1; }
       else { console.error(c.red("✗"), err?.stack || err); process.exitCode = 2; }
     },

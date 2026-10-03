@@ -191,11 +191,20 @@ test("the hook is merged into project settings once, next to other hooks", () =>
   const twice = mergeHookSettings(structuredClone(once));
   assert.deepEqual(twice, once);
   assert.equal(once.hooks.SessionStart.length, 2);
-  assert.equal(once.hooks.Stop.length, 1);
+  assert.equal(once.hooks.Stop.length, 2, "the existing Stop hook stays, ours is added");
+  assert.equal(once.hooks.UserPromptSubmit.length, 1);
+  assert.equal(once.hooks.SessionEnd.length, 1);
   assert.deepEqual(once.permissions, settings.permissions);
   const ours = once.hooks.SessionStart[1].hooks[0];
   assert.equal(ours.command, "node");
   assert.deepEqual(ours.args, ["${CLAUDE_PROJECT_DIR}/.claude/team-sync/claude-team.mjs", "hook", "session-start"]);
+  assert.deepEqual(once.hooks.UserPromptSubmit[0].hooks[0].args.slice(1), ["hook", "prompt"]);
+  // Without automatic sync only the session-start hook is ours, and turning it off removes the rest.
+  const manual = mergeHookSettings(structuredClone(once), { auto: false });
+  assert.equal(manual.hooks.SessionStart.length, 2);
+  assert.equal(manual.hooks.UserPromptSubmit, undefined);
+  assert.equal(manual.hooks.SessionEnd, undefined);
+  assert.deepEqual(manual.hooks.Stop, settings.hooks.Stop);
 });
 
 test("mapStrings leaves ids, signatures and image bytes alone", () => {
