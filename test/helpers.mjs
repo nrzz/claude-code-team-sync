@@ -59,7 +59,7 @@ export const SECRETS = {
 
 // A transcript shaped like Claude Code 2.1.x writes them, with every kind of thing a share must
 // remove or rewrite: secrets, account ids, thinking, an image, a tool-results file, absolute paths.
-export function writeFakeSession({ claude, root, home, id = randomUUID(), title = "Fix login redirect loop" }) {
+export function writeFakeSession({ claude, root, home, id = randomUUID(), title = "Fix login redirect loop", extraTurns = 0 }) {
   const dir = path.join(claude, "projects", projectSlug(root));
   const trDir = path.join(dir, id, "tool-results");
   fs.mkdirSync(trDir, { recursive: true });
@@ -91,6 +91,13 @@ export function writeFakeSession({ claude, root, home, id = randomUUID(), title 
   chain({ type: "user", sourceToolAssistantUUID: bash.uuid, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_03", content: "src/auth.ts:3: a", is_error: false }] } });
   chain({ type: "user", message: { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" + "A".repeat(200) } }, { type: "text", text: "Here is the screenshot of the loop" }] } });
   chain(assistant("04", [{ type: "text", text: `Fixed: the callback is validated now. The route regex is ^/app\\/[a-z]+$ and my notes are in ${path.join(home, "notes.txt")}. Next: add a test for /callback.` }], "end_turn"));
+  // A long session: each extra turn has a prompt, a tool call with a bulky result, and an answer.
+  for (let i = 0; i < extraTurns; i++) {
+    chain({ type: "user", message: { role: "user", content: `Step ${i}: refactor module ${i} and keep the tests green` } });
+    const use = chain(assistant(`x${i}a`, [{ type: "tool_use", id: `toolu_x${i}`, name: "Read", input: { file_path: path.join(root, "src", `module${i}.ts`) } }], "tool_use"));
+    chain({ type: "user", sourceToolAssistantUUID: use.uuid, message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_x${i}`, content: `export function module${i}() {\n${"  doWork();\n".repeat(150)}}` }] } });
+    chain(assistant(`x${i}b`, [{ type: "text", text: `Module ${i} is refactored: ${"the helper now takes options and returns early on empty input; ".repeat(6)}Tests pass.` }], "end_turn"));
+  }
   side({ type: "custom-title", customTitle: title, sessionId: id });
   side({ type: "last-prompt", lastPrompt: "Here is the screenshot", leafUuid: parent, sessionId: id });
   side({ type: "history-suppression", sessionId: id, cause: "restored_owner_mismatch", ts: Date.now(), vetoedAgainstAccountUuid: "acct-9999" });

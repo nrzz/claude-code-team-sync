@@ -1,6 +1,6 @@
 {
   "name": "claude-code-team-sync",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Share Claude Code sessions, notes and team context with coworkers through a git branch, a git repository or a synced folder (OneDrive, SharePoint, Teams, Google Drive, Dropbox).",
   "type": "module",
   "bin": {

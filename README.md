@@ -17,6 +17,21 @@ Claude Code keeps every conversation on the machine it ran on. A Team plan gives
 | Continue their exact session | Not possible | `claude-team resume <id>`: their transcript becomes your own session |
 | Keep the team on the same page | Hope everyone reads the wiki | Notes and `TEAM.md` reach every new session by themselves |
 
+## What it costs in tokens
+
+Every team member pays for what this puts in front of Claude, so it is lean by default and says what everything costs:
+
+| Part | Tokens | |
+| --- | --- | --- |
+| Background sync, automatic sharing, notices of teammates' news | 0 | Separate processes, and lines shown to you, not to Claude |
+| Session-start digest (default) | 0 when nothing is new, usually 50 to 300 when something is | Never more than about 375. `claude-team auto digest pointer` makes it one line, `off` removes it |
+| Skills | about 22 per session | Only `/team-load`'s one-line description is in Claude's skill list; the other four are user-only and cost nothing until typed |
+| `/team-load` | about 3K per load | The brief and the recent conversation, without tool output. `/team-load <id> full` loads up to about 15K |
+| `/team-share` | a brief of at most 25 lines, written by Claude | |
+| `/team`, `/team-note`, `/team-auto` | one short turn | The terminal command does the same for 0 |
+| `claude-team resume` | the whole shared conversation, once | It prints the size first and points to `/team-load` when the session is big |
+| Anything run as `claude-team ...` in a terminal | 0 | |
+
 ## Set up in 2 minutes
 
 One person per project, in the project folder (Node 18 or newer):
@@ -60,12 +75,12 @@ For a Teams channel: open the channel's Files tab, choose "Sync" (or "Add shortc
 | Type | What happens |
 | --- | --- |
 | `/team-share` | Claude writes a brief of this session (goal, state, decisions, next step, files) and shares it with the conversation |
-| `/team-load <id or topic>` | Loads a teammate's shared session into this one: their brief first, then the condensed conversation |
+| `/team-load <id or topic>` | Loads a teammate's shared session into this one: their brief, then the recent conversation without tool output (about 3K tokens; add `full` for more) |
 | `/team-note we deploy on Thursdays` | Adds a dated line to the team notes |
 | `/team` | Who shared what recently, and the newest notes |
 | `/team-auto live` | Your sessions are shared automatically as you work (`end`: when they end, `off`: only by hand, `skip`: not this session) |
 
-At every session start, the newest notes, `TEAM.md` and the latest shared sessions arrive in a short digest (capped at 3,000 characters, about 750 tokens). When something is new since your last session, a one-line notice tells you, and that notice costs no tokens.
+When something arrived since your last session (a shared session, a note, a change to `TEAM.md`), your next new session starts with a short digest of just that, and a one-line notice tells you. Each piece of news is shown once; a session that starts with nothing new gets nothing. Rules every session must follow belong in `CLAUDE.md`, which git already shares; `TEAM.md` is for the team's state and news.
 
 ## Automatic sync
 
@@ -138,13 +153,13 @@ Share sessions only with people who may see the code and data they touch.
 | --- | --- | --- |
 | `.claude/team-sync.json` (committed) | `project` | The project's name in the hub; taken from the git remote, so every clone agrees |
 | | `hub` | `{"type": "branch", "branch": "claude-team-hub", "remote": "origin"}`, `{"type": "git", "url": "...", "branch": "main"}` or `{"type": "folder", "label": "Claude Hub"}` |
-| | `digest` | `"off"` turns the session-start digest off for everyone |
-| | `digestChars` | Size cap of the digest, default 3000 |
+| | `digest` | Team default for the session-start digest: `"new"` (default), `"full"`, `"pointer"` or `"off"` |
+| | `digestChars` | Size cap of the digest, default 1500 characters (about 375 tokens) |
 | | `redact.patterns` | Extra regular expressions to redact |
 | | `autoSync`, `syncMinutes`, `notices`, `autoShare`, `shareMinutes` | Team defaults for automatic sync: `true`, `5`, `"notice"`, `"off"`, `10` |
 | `~/.claude/team-sync/config.json` (yours) | `name` | Your name in the hub; defaults to `git config user.name` |
 | | `folders` | Where each folder hub is on this machine |
-| | `digest` | `"off"` turns the digest off for you only |
+| | `digest`, `projects.<name>.digest` | Your own digest mode, set with `claude-team auto digest`; it wins over the team's |
 | | `projects.<name>.autoShare` and the other automatic sync keys | Your own choices, set with `claude-team auto`; they win over the team's |
 | Environment | `CLAUDE_TEAM_NAME`, `CLAUDE_TEAM_HUB_DIR`, `CLAUDE_TEAM_HOOK_TIMEOUT_MS` (default 8000), `CLAUDE_TEAM_SYNC_MINUTES`, `CLAUDE_TEAM_SHARE_MINUTES`, `CLAUDE_CONFIG_DIR` | Name, folder hub path, how long a session-start sync may take, interval overrides, and Claude's own config folder |
 
@@ -161,9 +176,10 @@ Share sessions only with people who may see the code and data they touch.
 
 Checked on 2026-10-03 against the transcript format of Claude Code 2.1.286, on Windows 11 by hand and on Windows, macOS and Linux with Node 20, 22 and 24 in CI:
 
-- **45 automated tests** (`npm test`), green on all nine OS and Node combinations. The first CI run caught a real bug that Windows alone could not show: on case-sensitive file systems, paths were left in shared transcripts. Fixed, and covered by a test. Unit tests cover redaction (16 secret kinds caught, 8 look-alikes such as `password: string` and `PASSWORD=${DB_PASSWORD}` left alone), the project-folder naming rule, path placeholders both ways (Windows to macOS included), and transcript cleanup: every removed record is re-linked so the conversation chain stays whole, and ids and signatures are never rewritten.
+- **50 automated tests** (`npm test`), green on all nine OS and Node combinations. The first CI run caught a real bug that Windows alone could not show: on case-sensitive file systems, paths were left in shared transcripts. Fixed, and covered by a test. Unit tests cover redaction (16 secret kinds caught, 8 look-alikes such as `password: string` and `PASSWORD=${DB_PASSWORD}` left alone), the project-folder naming rule, path placeholders both ways (Windows to macOS included), and transcript cleanup: every removed record is re-linked so the conversation chain stays whole, and ids and signatures are never rewritten.
 - **End to end, three hub types.** Two people with separate Claude folders and a real local git remote: init creates the hub branch; a share from one person is published with nothing secret or private in it (checked by cloning the hub branch and searching every file, the compressed transcript included); the other person's first session start shows the digest with no setup; `/team-load`'s command finds the session by topic; `resume` rebuilds the transcript with the receiver's paths and no placeholder left; notes with quotes and symbols arrive from both sides; the next session start announces what is new. The same flow runs through a synced folder without git, and through an empty separate repository.
 - **Automatic sync, end to end.** Hooks run as Claude Code runs them, as separate processes with JSON on stdin: a teammate's share and note arrive mid-session as one notice, shown once; notices in `context` mode reach Claude and `off` stays silent; a `TEAM.md` edit reaches the other person with no sync command; `live` sharing updates the hub after a turn and not again inside its interval; a brief written with `/team-share` survives automatic updates; `end` sharing shares at session end and leaves a skipped session alone; `watch` prints news. One test runs the real detached background process and checks the hook returned at once while the sync finished behind it. These tests caught a real bug: notes written in the same minute were reported in the wrong order.
+- **Token budgets, as tests.** The default digest is empty when nothing is new, under 500 characters for a day's news, and never over 1,500; an update of a session already announced is not news again, and an unchanged `TEAM.md` is not repeated. Only `/team-load` is visible to Claude, every skill description is under 100 characters, and the `/team-share` brief is capped at 25 lines. Loading a 60-turn session by default stays under 16,000 characters with tool output left out and the latest state kept; `full` loads more; `resume` and `list` show the session's size.
 - **Speed.** Measured on Windows: the per-prompt hook takes about 110 ms (mostly starting Node) and never waits for the network; a session start with a fresh local copy takes about 160 ms.
 - **Resilience.** An unreachable hub leaves the hooks silent and quick (exit code 0), and malformed hook input is ignored.
 

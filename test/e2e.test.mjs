@@ -101,10 +101,10 @@ test("branch hub: share, digest, load, resume and notes between two people", asy
     const out = JSON.parse(r.out);
     const ctx = out.hookSpecificOutput.additionalContext;
     assert.equal(out.hookSpecificOutput.hookEventName, "SessionStart");
-    assert.match(ctx, /Recently shared sessions/);
+    assert.match(ctx, /Shared sessions \(\/team-load <id> loads one\):/);
     assert.ok(ctx.includes(s.id.slice(0, 8)) && ctx.includes("Alice") && ctx.includes("Fix login redirect loop"));
     assert.match(ctx, /next: add a test for \/callback/);
-    assert.ok(ctx.length <= 3000);
+    assert.ok(ctx.length <= 1500, `digest is ${ctx.length} characters`);
   });
 
   await t.test("resume and compact sources add nothing", () => {

@@ -33,7 +33,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 const SELF = fileURLToPath(import.meta.url);
 const IS_WIN = process.platform === "win32";
 const REPO_URL = "https://github.com/nrzz/claude-code-team-sync";
@@ -1008,7 +1008,8 @@ function findSharedSession(hub, key, ref) {
 }
 function sessionLine(s) {
   const m = s.meta;
-  return `${c.cyan(m.id.slice(0, 8))}  ${String(m.sharedAt).slice(0, 10)}  ${c.bold(m.author)}  ${oneLine(m.title, 60)}${m.next ? c.dim(`  next: ${oneLine(m.next, 60)}`) : ""}`;
+  const size = m.approxTokens ? c.dim(`  ~${kTokens(m.approxTokens)} tok`) : "";
+  return `${c.cyan(m.id.slice(0, 8))}  ${String(m.sharedAt).slice(0, 10)}  ${c.bold(m.author)}  ${oneLine(m.title, 60)}${size}${m.next ? c.dim(`  next: ${oneLine(m.next, 60)}`) : ""}`;
 }
 
 async function cmdInit(args, ctx) {
@@ -1194,6 +1195,7 @@ async function cmdShare(args, ctx) {
     branch: sum.branch || info.branch, claudeVersion: sum.version, models: sum.models,
     summary: oneLine(sum.firstPrompt ? readable(sum.firstPrompt) : title, 200), next: nextStepOf(brief),
     counts: { prompts: sum.prompts, assistantMessages: sum.assistantMessages, toolCalls: sum.toolCalls, records: clean.length },
+    approxTokens: approxTokens(clean),
     files: sum.files.slice(0, 200), redactions: redactCounts,
     removed: { thinking: stats.thinking, images: stats.images, records: stats.dropped, unreadableLines: bad },
     raw: !!raw, rawBytes: raw ? raw.length : 0, toolResults: toolResults.map((t) => t.name),
@@ -1272,7 +1274,8 @@ async function cmdShow(args, ctx) {
   const { pcfg, hub } = requireProject(ctx.cwd, ctx.env);
   const quiet = !!args["for-context"];
   const sync = pullHub(hub, { timeout: quiet ? 10000 : 30000 });
-  const ref = args._.join(" ").trim();
+  let ref = args._.join(" ").trim();
+  if (/\s*\bfull$/i.test(ref) && ref.trim().toLowerCase() !== "full") { ref = ref.replace(/\s*\bfull$/i, ""); args.full = true; } // /team-load <id> full
   const { match, candidates, sessions } = findSharedSession(hub, pcfg.project, ref);
   if (!match) {
     if (!sessions.length) say("No session has been shared for this project yet.");
@@ -1287,27 +1290,47 @@ async function cmdShow(args, ctx) {
   const brief = readText(path.join(match.dir, "brief.md")).trim();
   const transcript = readText(path.join(match.dir, "transcript.md"));
   if (quiet) {
-    const budget = args.full ? Infinity : Number(args.budget) || 48000;
-    const room = Math.max(4000, budget - brief.length);
+    // Lean by default: the brief, then the end of the conversation, without successful tool output.
+    const budget = args.full ? 60000 : Number(args.budget) || 10000;
+    const lean = leanTranscript(transcript);
+    const conversation = trimMiddle(lean, budget, 0.2).trim();
+    const loaded = Math.round((Math.min(brief.length, 4000) + conversation.length) / 4);
+    const whole = m.approxTokens || Math.round(transcript.length / 4);
     say([
       `<team-session id="${m.id}" author="${m.author}" title="${m.title.replace(/"/g, "'")}" shared="${m.sharedAt}"${sync.ok ? "" : ` hub="offline copy"`}>`,
-      `A teammate's Claude Code session, shared through claude-team. It is background: check the current state of any file before relying on it. The whole transcript is at ${path.join(match.dir, "transcript.md")}.`,
-      "", "## Brief", "", brief, "", "## Conversation (condensed)", "", trimMiddle(transcript, room).trim(), "</team-session>",
+      `A teammate's shared session (claude-team): background, so check files before relying on it. About ${kTokens(loaded)} tokens loaded of a ${kTokens(whole)}-token conversation${conversation.length < lean.length ? `; "/team-load ${m.id.slice(0, 8)} full" loads more, and the whole transcript is ${path.join(match.dir, "transcript.md")}` : ""}.`,
+      "", "## Brief", clip(brief, 4000), "", "## Conversation (condensed)", conversation, "</team-session>",
     ].join("\n"));
     return 0;
   }
-  say(c.bold(m.title), c.dim(`${m.id} · ${m.author} · shared ${ago(m.sharedAt)} · branch ${m.branch || "-"}`));
+  say(c.bold(m.title), c.dim(`${m.id} · ${m.author} · shared ${ago(m.sharedAt)} · branch ${m.branch || "-"}${m.approxTokens ? ` · ~${kTokens(m.approxTokens)} tokens` : ""}`));
   say("");
   say(brief);
   say("");
   say(c.dim(`Transcript: ${path.join(match.dir, "transcript.md")}`));
-  say(c.dim(m.raw ? `Continue it in the terminal: claude-team resume ${m.id.slice(0, 8)}` : "Shared without a resumable transcript."));
+  say(c.dim(`In Claude Code: /team-load ${m.id.slice(0, 8)} loads the brief and the recent conversation (about 3K tokens).`));
+  if (m.raw) say(c.dim(`Exact continuation: claude-team resume ${m.id.slice(0, 8)}${m.approxTokens ? ` (re-sends all ~${kTokens(m.approxTokens)} tokens with your first message)` : ""}.`));
   return 0;
 }
+
+const kTokens = (n) => (n >= 1000 ? `${Math.round(n / 100) / 10}K` : String(n));
+// The readable transcript without its title lines and without successful tool results, which are
+// the bulk of a coding session and rarely needed to continue it. Failed tool calls stay.
+export function leanTranscript(text) {
+  return String(text).split("\n")
+    .filter((line, i) => !(i < 3 && (/^# /.test(line) || /^Shared by \*\*/.test(line))) && !/^ {2}- ↳ /.test(line))
+    .join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+// A rough token count of what a resumed session sends: the conversation's message content.
+export function approxTokens(records) {
+  let chars = 0;
+  for (const r of records) if ((r.type === "user" || r.type === "assistant") && !r.isSidechain && r.message) chars += JSON.stringify(r.message.content ?? "").length;
+  return Math.round(chars / 4);
+}
 // Keep the start (what was asked) and most of the end (where it stands); cut the middle.
-export function trimMiddle(text, max) {
+export function trimMiddle(text, max, headShare = 0.25) {
   if (!Number.isFinite(max) || text.length <= max) return text;
-  const headLen = Math.floor(max * 0.25), tailLen = max - headLen - 120;
+  const headLen = Math.floor(max * headShare), tailLen = max - headLen - 120;
   const head = text.slice(0, headLen).replace(/\n[^\n]*$/, "");
   const tail = text.slice(text.length - tailLen).replace(/^[^\n]*\n/, "");
   const cut = text.length - head.length - tail.length;
@@ -1348,6 +1371,11 @@ async function cmdResume(args, ctx) {
   const command = `claude --resume "${out}" --fork-session`;
   say(c.green("✓"), `"${m.title}" by ${m.author} is ready to continue as your own session (${records.length} records, paths mapped to ${localRoot}).`);
   if (leftovers) say(c.yellow("!"), `${leftovers} strings still hold a placeholder; they point at files outside the project.`);
+  const size = m.approxTokens || approxTokens(records);
+  if (size > 20000) {
+    say(c.yellow("!"), `Resuming re-sends this whole conversation, about ${kTokens(size)} tokens, with your first message (cached after that).`);
+    say(`  For a lighter start, in Claude Code: ${c.cyan(`/team-load ${m.id.slice(0, 8)}`)} loads the brief and the recent conversation for about 3K tokens.`);
+  }
   if (args.launch) {
     say(c.dim(`Starting: ${command}`));
     const child = spawn(command, { cwd: localRoot, stdio: "inherit", shell: true });
@@ -1449,6 +1477,9 @@ async function cmdAuto(args, ctx) {
     case "notices":
       if (!NOTICE_MODES.includes(value)) fail(`auto notices takes ${NOTICE_MODES.join(", ")}`);
       scope.notices = value; break;
+    case "digest":
+      if (!DIGEST_MODES.includes(value)) fail(`auto digest takes ${DIGEST_MODES.join(", ")}`);
+      scope.digest = value; break;
     case "every":
       if (!(Number(value) >= 1)) fail("auto every takes a number of minutes, 1 or more");
       scope.syncMinutes = Number(value); break;
@@ -1458,7 +1489,7 @@ async function cmdAuto(args, ctx) {
       say(c.green("✓"), what === "skip" ? `Session ${sid.slice(0, 8)} will not be shared automatically.` : `Session ${sid.slice(0, 8)} follows your automatic sharing setting again.`);
       return 0;
     default:
-      fail(`Unknown setting "${what}". Try: auto live | auto end | auto off | auto sync on|off | auto notices notice|context|off | auto every <minutes> | auto skip`);
+      fail(`Unknown setting "${what}". Try: auto live | auto end | auto off | auto sync on|off | auto notices notice|context|off | auto digest new|full|pointer|off | auto every <minutes> | auto skip`);
   }
   if (what && what !== "status") saveUserConfig(ucfg, env);
   const a = autoSettings(pcfg, loadUserConfig(env));
@@ -1471,6 +1502,8 @@ async function cmdAuto(args, ctx) {
   say(`  Sync:     ${a.autoSync ? `on, every ${a.syncMinutes} min while you work (${last})` : "off: the hub syncs at session start and when you share or note"}`);
   say(`  Notices:  ${notices}`);
   say(`  Sharing:  ${share}`);
+  const digest = { new: "only what is new since your last session; nothing new costs nothing", full: "what the hub holds, up to about 400 tokens per session", pointer: "one line of counts when something is new", off: "off" }[digestMode(pcfg, loadUserConfig(env))];
+  say(`  Digest:   ${digest}`);
   return 0;
 }
 
@@ -1485,32 +1518,60 @@ async function cmdContext(args, ctx) {
   return 0;
 }
 
-// seen = { at, notes } from the person's last session start: sessions shared after `at` are new,
-// and since note files only grow, notes by others beyond the count seen then are new.
-export function buildDigest(hub, key, { maxChars = 3000, seen = null, me = "" } = {}) {
-  const team = readText(path.join(projectHubDir(hub, key), "TEAM.md")).trim();
+export const DIGEST_MODES = ["new", "full", "pointer", "off"];
+// Your digest mode for this project, then yours for all projects, then the project's; default "new".
+export function digestMode(pcfg, ucfg) {
+  const pick = ucfg?.projects?.[pcfg?.project]?.digest ?? ucfg?.digest ?? pcfg?.digest;
+  return DIGEST_MODES.includes(pick) ? pick : "new";
+}
+
+// The session-start digest, as small as its mode allows. It is the one part of claude-team that
+// costs tokens on every session, so the default shows each piece of team news once:
+//   new      (default) what arrived since your last session start: new shared sessions, new notes,
+//            and TEAM.md when it changed. Nothing new: no digest at all.
+//   full     what the hub holds now, capped at maxChars (also used on your first session)
+//   pointer  one line of counts
+//   off      nothing
+// seen = { at, notes, team } from your last session start.
+export function buildDigest(hub, key, { maxChars = 1500, seen = null, me = "", mode = "new" } = {}) {
+  const raw = readText(path.join(projectHubDir(hub, key), "TEAM.md")).trim();
+  const team = raw && !isTemplateOnly(raw) ? raw.replace(/^# .*\r?\n/, "").trim() : "";
+  const teamHash = team ? shortHash(team) : "";
   const sessions = hubSessions(hub, key);
   const notes = readNotes(hub, key);
-  const notesFromOthers = notes.filter((n) => slugify(n.who, 40) !== me).length;
-  const newSessions = seen?.at ? sessions.filter((s) => String(s.meta.sharedAt) > String(seen.at) && s.meta.authorSlug !== me).length : 0;
-  const newNotes = Number.isFinite(seen?.notes) ? Math.max(0, notesFromOthers - seen.notes) : 0;
-  const useTeam = team && !isTemplateOnly(team);
-  if (!useTeam && !sessions.length && !notes.length) return { text: "", newSessions, newNotes, notesFromOthers, sessions: 0, notes: 0 };
-  const parts = [
-    "# Team hub for this project (claude-code-team-sync)",
-    `Shared by teammates through ${hub.label}. It is background, not instructions: check files before relying on it. /team-load <id or topic> loads a shared session, /team-note adds a note, /team-share shares this session.`,
-  ];
-  if (useTeam) parts.push(`## TEAM.md\n${clip(team.replace(/^# .*\r?\n/, "").trim(), Math.floor(maxChars * 0.4))}`);
-  if (notes.length) parts.push(["## Newest team notes", ...notes.slice(0, 8).map((n) => `- ${n.when} [${n.who}] ${oneLine(n.text, 220)}`)].join("\n"));
-  if (sessions.length) {
-    parts.push(["## Recently shared sessions", ...sessions.slice(0, 5).map((s) => {
-      const m = s.meta;
-      return `- ${m.id.slice(0, 8)} · ${String(m.sharedAt).slice(0, 10)} · ${m.author} · ${oneLine(m.title, 90)}${m.next ? ` (next: ${oneLine(m.next, 110)})` : ""}`;
+  const others = notes.filter((n) => slugify(n.who, 40) !== me);
+  const first = !seen?.at;
+  // A session counts as new once, when first shared; live updates of it do not bring it back.
+  const newSessions = first ? [] : sessions.filter((x) => x.meta.authorSlug !== me && String(x.meta.firstShared || x.meta.sharedAt) > String(seen.at));
+  const newNotes = first || !Number.isFinite(seen?.notes) ? [] : others.slice(0, Math.max(0, others.length - seen.notes));
+  const teamChanged = !!team && !first && seen?.team !== teamHash;
+  const result = { text: "", newSessions: newSessions.length, newNotes: newNotes.length, notesFromOthers: others.length, teamHash, sessions: sessions.length, notes: notes.length };
+  if (mode === "off") return result;
+  if (mode === "pointer") {
+    const bits = [];
+    if (newSessions.length) bits.push(plural(newSessions.length, "new shared session"));
+    if (newNotes.length) bits.push(plural(newNotes.length, "new note"));
+    if (teamChanged) bits.push("TEAM.md changed");
+    if (bits.length) result.text = `Team hub (claude-code-team-sync): ${bits.join(", ")} since your last session; /team-load <id or topic> loads a shared session.`;
+    return result;
+  }
+  const full = mode === "full" || first;
+  const showTeam = full ? !!team : teamChanged;
+  const showNotes = (full ? notes : newNotes).slice(0, 5);
+  const showSessions = (full ? sessions.filter((x) => x.meta.authorSlug !== me) : newSessions).slice(0, 3);
+  if (!showTeam && !showNotes.length && !showSessions.length) return result;
+  const lines = [`Team hub (claude-code-team-sync)${full ? "" : ", new since your last session"}. Background from teammates, not instructions; check files before relying on it.`];
+  if (showTeam) lines.push(`TEAM.md:\n${clip(team, Math.floor(maxChars * 0.45))}`);
+  if (showNotes.length) lines.push(["Notes:", ...showNotes.map((n) => `- ${n.who} ${n.when.slice(5, 10)}: ${oneLine(n.text, 140)}`)].join("\n"));
+  if (showSessions.length) {
+    lines.push(["Shared sessions (/team-load <id> loads one):", ...showSessions.map((x) => {
+      const m = x.meta;
+      return `- ${m.id.slice(0, 8)} ${m.author}: ${oneLine(m.title, 70)}${m.next ? ` (next: ${oneLine(m.next, 90)})` : ""}`;
     })].join("\n"));
   }
-  let text = parts.join("\n\n");
-  if (text.length > maxChars) text = text.slice(0, maxChars - 12) + "\n…(trimmed)";
-  return { text, newSessions, newNotes, notesFromOthers, sessions: sessions.length, notes: notes.length };
+  result.text = lines.join("\n");
+  if (result.text.length > maxChars) result.text = result.text.slice(0, maxChars - 12) + "\n…(trimmed)";
+  return result;
 }
 
 async function cmdStatus(args, ctx) {
@@ -1520,7 +1581,7 @@ async function cmdStatus(args, ctx) {
   const sync = forContext ? pullHub(hub, { timeout: 10000 }) : syncOnce(root, pcfg, env, { timeout: 30000 });
   const me = whoAmI(env, root);
   if (forContext) {
-    const d = buildDigest(hub, pcfg.project, { maxChars: 6000, me: slugify(me, 40) });
+    const d = buildDigest(hub, pcfg.project, { maxChars: 3000, me: slugify(me, 40), mode: "full" });
     say(d.text || "The team hub is empty so far: nobody has shared a session or a note for this project.");
     if (!sync.ok) say(`\n(The hub could not be synced: ${sync.error}. This is the copy on this machine.)`);
     return 0;
@@ -1611,18 +1672,18 @@ async function hookSessionStart(input, ctx) {
   updateSessionState(sid, { seen: readHubState(hub, pcfg.project, env).seq }, env); // the digest covers what is here now
 
   const out = {};
-  if (pcfg.digest !== "off" && ucfg.digest !== "off") {
-    const seen = ucfg.lastSeen?.[pcfg.project] || null;
-    const d = buildDigest(hub, pcfg.project, { maxChars: Number(pcfg.digestChars) || 3000, seen, me });
-    const fresh = loadUserConfig(env); // saved again in full, so another hook's write is not lost
-    fresh.lastSeen = { ...(fresh.lastSeen || {}), [pcfg.project]: { at: new Date().toISOString(), notes: d.notesFromOthers } };
-    saveUserConfig(fresh, env);
-    if (d.text) out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: d.text };
-    const news = [];
-    if (d.newSessions) news.push(plural(d.newSessions, "new shared session"));
-    if (d.newNotes) news.push(plural(d.newNotes, "new note"));
-    if (news.length) out.systemMessage = `Team hub: ${news.join(" and ")} since your last session. /team shows them.`;
-  }
+  const mode = digestMode(pcfg, ucfg);
+  const seen = ucfg.lastSeen?.[pcfg.project] || null;
+  const d = buildDigest(hub, pcfg.project, { maxChars: Number(pcfg.digestChars) || 1500, seen, me, mode });
+  const fresh = loadUserConfig(env); // read again and saved whole, so another hook's write is not lost
+  fresh.lastSeen = { ...(fresh.lastSeen || {}), [pcfg.project]: { at: new Date().toISOString(), notes: d.notesFromOthers, team: d.teamHash } };
+  saveUserConfig(fresh, env);
+  if (d.text) out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: d.text };
+  // The notice line is for the person only: it costs no tokens, whatever the digest mode.
+  const news = [];
+  if (d.newSessions) news.push(plural(d.newSessions, "new shared session"));
+  if (d.newNotes) news.push(plural(d.newNotes, "new note"));
+  if (news.length) out.systemMessage = `Team hub: ${news.join(" and ")} since your last session. /team shows them.`;
   if (!out.systemMessage && !sync.ok && sync.offline) out.systemMessage = `Team hub offline (${oneLine(sync.error, 80)}); using the copy on this machine.`;
   emit(out);
 }
@@ -1675,69 +1736,70 @@ async function hookSessionEnd(input, ctx) {
 // ---------------------------------------------------------------------------------------------
 
 const RUN = `node "\${CLAUDE_PROJECT_DIR}/.claude/team-sync/claude-team.mjs"`;
+// Every skill but /team-load is user-only (disable-model-invocation), which keeps it out of the
+// skill list Claude reads on every turn: it costs no tokens until someone types it. Replies are
+// kept short because output tokens are the dearest kind.
 export const SKILLS = {
   team: `---
 name: team
-description: Show the team hub for this project (claude-code-team-sync), meaning the sessions teammates shared, the team notes and TEAM.md. Use when the user asks what teammates did, shared or decided.
+description: Show what teammates shared in the team hub (claude-code-team-sync).
+disable-model-invocation: true
 allowed-tools: Bash(node *)
 ---
 
 !\`${RUN} status --for-context\`
 
-Summarise the block above for the user in a few lines: who shared which session recently and its next step, and the newest notes. End with how to load one (\`/team-load <id or topic>\`) and how to share this session (\`/team-share\`). If the hub is empty, say so in one line.
+Summarise the block above in at most four lines: the newest shared sessions with their next step, and the newest notes. If it is empty, say so in one line.
 `,
   "team-load": `---
 name: team-load
-description: Load a Claude Code session that a teammate shared through the team hub (claude-code-team-sync) into this conversation, by id or topic, to continue their work. Use when the user mentions a teammate's session, handover or shared chat.
-argument-hint: <session id or topic words>
+description: Load a teammate's shared Claude Code session (claude-code-team-sync) by id or topic.
+argument-hint: <session id or topic> [full]
 allowed-tools: Bash(node *)
 ---
 
 !\`${RUN} show --for-context "$ARGUMENTS"\`
 
-The block above is either a teammate's shared session (brief first, then the condensed conversation) or a list of shared sessions when nothing matched.
-
-- If it is a session: start your reply with one line naming whose session it is, its title and the next step it names. Then continue from there. Check the current state of any file before acting on it, because the session may be days old and the code may have moved on. The full transcript file is named in the block if you need a part that was cut.
-- If it is a list: show it and ask which one to load.
+If the block above is a session: say in one line whose it is, its title and its next step, then continue from there, checking a file's current state before acting on it. If it is a list: show it and ask which one.
 `,
   "team-share": `---
 name: team-share
-description: Share this Claude Code session with the team through the team hub (claude-code-team-sync), with a written brief so a teammate can pick it up.
+description: Share this session with the team (claude-code-team-sync).
 disable-model-invocation: true
 argument-hint: [title]
 allowed-tools: Bash(node *)
 ---
 
-Share this session with the team. Title: $ARGUMENTS (if empty, choose a short title for what this session worked on).
+Share this session. Title: $ARGUMENTS (if empty, a short title for what this session did).
 
-1. Write a brief for a teammate who has none of this conversation, in Markdown, with exactly these sections: **Goal**, **Where it stands** (done, half done), **Decisions and why** (including approaches that failed), **Next step** (the exact first thing to do and how to tell it is done), **Files in play** (paths relative to the project root), **Open questions**. Under 60 lines. Never put secrets, tokens or passwords in it.
-2. Pass the brief on stdin to this command, in one shell call (a quoted heredoc such as <<'BRIEF' in bash, or a here-string piped in PowerShell):
-   ${RUN} share \${CLAUDE_SESSION_ID} --title "<the title>" --brief -
-3. Reply with the command's summary (what was shared, removed and redacted) and the line teammates use to load it.
+1. Write a terse brief for a teammate who has none of this conversation: at most 25 lines of Markdown with the sections Goal, Where it stands, Decisions (with approaches that failed), Next step (and how to tell it is done), Files, Open questions. No secrets.
+2. Pass it on stdin in one shell call (a quoted heredoc such as <<'BRIEF' in bash, or a here-string piped in PowerShell):
+   ${RUN} share \${CLAUDE_SESSION_ID} --title "<title>" --brief -
+3. Reply in at most three lines: what was shared, and the /team-load line for teammates.
 `,
   "team-note": `---
 name: team-note
-description: Add a dated line to the team's shared notes in the team hub (claude-code-team-sync). Every teammate's next session sees the newest notes.
+description: Add a team note (claude-code-team-sync).
 disable-model-invocation: true
 argument-hint: <the note>
 allowed-tools: Bash(node *)
 ---
 
-Save this as a team note: $ARGUMENTS
+Run \`${RUN} note --stdin\` with this text on stdin, unchanged (a quoted heredoc such as <<'NOTE' in bash, or a here-string piped in PowerShell): $ARGUMENTS
 
-Run \`${RUN} note --stdin\` and pass the note text on stdin exactly as written above (a quoted heredoc such as <<'NOTE' in bash, or a here-string piped in PowerShell), so quotes and symbols in it survive. If the note is empty, ask what to save instead. Reply with one line quoting what was saved.
+If the text is empty, ask for it. Reply in one line.
 `,
   "team-auto": `---
 name: team-auto
-description: Set automatic team sharing for yourself (claude-code-team-sync), or keep this session out of it.
+description: Set automatic team sharing (claude-code-team-sync).
 disable-model-invocation: true
-argument-hint: [live | end | off | skip | unskip | status]
+argument-hint: [live | end | off | skip | unskip]
 allowed-tools: Bash(node *)
 ---
 
 !\`${RUN} auto $ARGUMENTS --session \${CLAUDE_SESSION_ID}\`
 
-Reply in one or two lines with what is now set, from the output above: live shares your sessions as you work, end shares each one when it ends, off leaves sharing to /team-share, and skip keeps this session out.
+Reply in one line with what is now set, from the output above.
 `,
 };
 
@@ -1843,6 +1905,7 @@ ${c.bold("Automatic sync")} (on by default: a background sync every few minutes 
   claude-team auto sync on|off             background sync for you
   claude-team auto notices notice|context|off   how teammates' news reaches you
   claude-team auto every <minutes>         how often to sync (default 5)
+  claude-team auto digest new|full|pointer|off  what a new session is told (default: only what is new)
   claude-team watch [--every <minutes>]    keep syncing from a terminal tab, with news
 
 ${c.bold("Team context")}
