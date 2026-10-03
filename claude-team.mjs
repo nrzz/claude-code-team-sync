@@ -544,17 +544,23 @@ function pathVariants(p) {
 // Maps the sharer's tool-results folder, project root, Claude projects folder name and home
 // folder to placeholders, longest first. Windows paths match in any letter case.
 export function pathMapper({ toolResults, root, roots = [], slug, home }) {
-  const table = new Map();
-  const add = (p, token) => { if (p) for (const v of pathVariants(p)) if (!table.has(v.toLowerCase())) table.set(v.toLowerCase(), token); };
+  // Windows paths compare in any letter case; macOS and Linux paths compare exactly.
+  const winish = [toolResults, root, ...roots, home].some((p) => /^[a-zA-Z]:|\\/.test(String(p || "")));
+  const norm = (s) => (winish ? s.toLowerCase() : s);
+  const table = new Map(); // normalized spelling -> placeholder
+  const spellings = [];
+  const add = (p, token) => {
+    if (!p) return;
+    for (const v of pathVariants(p)) if (!table.has(norm(v))) { table.set(norm(v), token); spellings.push(v); }
+  };
   add(toolResults, "{{TOOL_RESULTS}}");
   for (const r of [root, ...roots]) add(r, "{{PROJECT_ROOT}}");
   add(home, "{{HOME}}");
-  const keys = [...table.keys()].sort((a, b) => b.length - a.length);
-  const winish = [toolResults, root, ...roots, home].some((p) => /^[a-zA-Z]:|\\/.test(String(p || "")));
-  const re = keys.length ? new RegExp(`(?:${keys.map(esc).join("|")})(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_])`, winish ? "gi" : "g") : null;
+  spellings.sort((a, b) => b.length - a.length);
+  const re = spellings.length ? new RegExp(`(?:${spellings.map(esc).join("|")})(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_])`, winish ? "gi" : "g") : null;
   const slugRe = slug && slug.length > 3 ? new RegExp(`${esc(slug)}(?![A-Za-z0-9_-])`, "g") : null;
   return (s) => {
-    let out = re ? s.replace(re, (m) => table.get(m.toLowerCase()) || m) : s;
+    let out = re ? s.replace(re, (m) => table.get(norm(m)) || m) : s;
     if (slugRe) out = out.replace(slugRe, "{{PROJECT_SLUG}}");
     return out;
   };

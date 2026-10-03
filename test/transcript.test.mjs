@@ -73,6 +73,11 @@ test("paths become placeholders and come back as the receiver's paths", () => {
   assert.equal(out("C:\\Users\\alice\\.claude\\projects\\D--Work-webapp\\memory\\m.md"), "{{HOME}}\\.claude\\projects\\{{PROJECT_SLUG}}\\memory\\m.md");
   assert.equal(out("see D:\\Work\\webapp."), "see {{PROJECT_ROOT}}.", "a full stop after a path still matches");
 
+  const posix = pathMapper({ root: "/tmp/ct-L9eIpn/webapp", home: "/tmp/ct-L9eIpn", slug: "-tmp-ct-L9eIpn-webapp", toolResults: "/tmp/ct-L9eIpn/.claude/projects/-tmp-ct-L9eIpn-webapp/x/tool-results" });
+  assert.equal(posix("open /tmp/ct-L9eIpn/webapp/src/a.ts"), "open {{PROJECT_ROOT}}/src/a.ts", "mixed-case POSIX paths match exactly");
+  assert.equal(posix("/tmp/ct-l9eipn/webapp/src/a.ts"), "/tmp/ct-l9eipn/webapp/src/a.ts", "POSIX paths are case-sensitive");
+  assert.equal(posix("/tmp/ct-L9eIpn/notes.txt"), "{{HOME}}/notes.txt");
+
   const back = importMapper({ root: "/Users/bob/code/webapp", home: "/Users/bob", slug: "-Users-bob-code-webapp", toolResults: "/Users/bob/.claude/team-sync/imports/abc/tool-results" });
   assert.equal(back("open {{PROJECT_ROOT}}\\src\\a.ts now"), "open /Users/bob/code/webapp/src/a.ts now");
   assert.equal(back("{{TOOL_RESULTS}}\\b.txt"), "/Users/bob/.claude/team-sync/imports/abc/tool-results/b.txt");
