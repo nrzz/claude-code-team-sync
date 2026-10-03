@@ -1818,7 +1818,8 @@ function installIntoProject(root) {
   const dir = path.join(root, VENDOR_DIR);
   fs.mkdirSync(dir, { recursive: true });
   const target = path.join(dir, VENDOR_FILE);
-  if (path.resolve(SELF).toLowerCase() !== path.resolve(target).toLowerCase()) fs.copyFileSync(SELF, target);
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } }; // macOS: /var is a link
+  if (real(SELF).toLowerCase() !== real(target).toLowerCase()) fs.copyFileSync(SELF, target);
   writeText(path.join(dir, "README.md"), VENDOR_README);
   for (const [name, body] of Object.entries(SKILLS)) writeText(path.join(root, ".claude", "skills", name, "SKILL.md"), body);
 }
