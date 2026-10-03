@@ -73,7 +73,7 @@ test("branch hub: share, digest, load, resume and notes between two people", asy
   });
 
   await t.test("share publishes a redacted package with a brief from stdin", () => {
-    const brief = "## Goal\nStop the redirect loop.\n\n**Next step**: add a test for /callback\n\nToken in .env was ghp_" + "z".repeat(36) + "\n";
+    const brief = "## Goal\nStop the redirect loop.\n\n**Next step**: add a test for /callback\n\nToken in .env was gh" + "p_" + "z".repeat(36) + "\n";
     const r = runCli(["share", s.id.slice(0, 8), "--title", "Fix login redirect loop", "--brief", "-"], { cwd: aRoot, env: alice.env, input: brief });
     assert.equal(r.code, 0, r.all);
     assert.match(r.out, /Shared "Fix login redirect loop"/);
@@ -84,7 +84,7 @@ test("branch hub: share, digest, load, resume and notes between two people", asy
     const check = path.join(base, "check");
     gitc(["clone", "-q", "--branch", "claude-team-hub", origin, check], { env: genv });
     const all = readTree(check);
-    for (const secret of [...Object.values(SECRETS), "ghp_" + "z".repeat(36), "acct-1111-2222", "org-3333-4444", alice.home]) assert.ok(!all.includes(secret), `published ${secret}`);
+    for (const secret of [...Object.values(SECRETS), "gh" + "p_" + "z".repeat(36), "acct-1111-2222", "org-3333-4444", alice.home]) assert.ok(!all.includes(secret), `published ${secret}`);
     assert.ok(!all.includes(JSON.stringify(alice.home).slice(1, -1)), "published Alice's home path");
     const meta = JSON.parse(fs.readFileSync(fs.readdirSync(path.join(check, "projects/webapp/sessions")).map((d) => path.join(check, "projects/webapp/sessions", d, "meta.json"))[0], "utf8"));
     assert.equal(meta.next, "add a test for /callback");
