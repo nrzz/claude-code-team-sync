@@ -1,6 +1,6 @@
 # Claude Code team sync
 
-[![test](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml/badge.svg)](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml)
+[![test](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml/badge.svg)](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![node >= 18](https://img.shields.io/badge/node-%3E%3D18-339933.svg) ![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg) [![part of the Claude Code toolkit](https://img.shields.io/badge/Claude%20Code-toolkit-d97757.svg)](https://github.com/nrzz/claude-code-toolkit)
 
 Work on one project with your coworkers in Claude Code without starting from zero every time. Share the session you are in with one command, pick up a teammate's session where they left it, and give every new session the team's notes and decisions before anyone types a word.
 
@@ -195,6 +195,23 @@ Not verified yet: opening an imported transcript with `claude --resume <file> --
 After `init`, a project holds `.claude/team-sync.json`, `.claude/team-sync/claude-team.mjs` (and a README), `.claude/skills/team*/SKILL.md`, and the hooks in `.claude/settings.json`. To update all of it later, run `npx -y github:nrzz/claude-code-team-sync update` in the project and commit.
 
 Related: [claude-code-handover](https://github.com/nrzz/claude-code-handover) keeps your own sessions short with a handover file each new session loads by itself. The two work well together: the handover is for you tomorrow, the hub is for your teammates today.
+
+## Contributing
+
+Issues and pull requests are welcome: start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [good first issues](https://github.com/nrzz/claude-code-team-sync/issues?q=is%3Aopen+label%3A%22good+first+issue%22). Questions go to [Discussions](https://github.com/nrzz/claude-code-team-sync/discussions); security reports go through [SECURITY.md](SECURITY.md).
+
+## Part of the Claude Code toolkit
+
+Small, dependency-free tools that make Claude Code cheaper, safer and easier to share, all in the [Claude Code toolkit](https://github.com/nrzz/claude-code-toolkit):
+
+- [claude-code-handover](https://github.com/nrzz/claude-code-handover): short sessions with a handover file every new session loads by itself
+- [claude-code-glow](https://github.com/nrzz/claude-code-glow): themes for the whole interface, a status line and a live HUD
+- [claude-code-guardrails](https://github.com/nrzz/claude-code-guardrails): safety presets that stop risky commands and edits
+- [claude-code-notify](https://github.com/nrzz/claude-code-notify): a ping when Claude needs you or finishes
+- [claude-md-doctor](https://github.com/nrzz/claude-md-doctor): what your CLAUDE.md costs every session, and how to slim it
+- [claude-code-starter-kits](https://github.com/nrzz/claude-code-starter-kits): a lean, safe .claude/ for your stack in one command
+- [claude-cost-guard](https://github.com/nrzz/claude-cost-guard): daily and weekly token budgets with zero-token warnings
+- [claude-session-replay](https://github.com/nrzz/claude-session-replay): search past sessions and export one as an HTML replay
 
 ## License
 
