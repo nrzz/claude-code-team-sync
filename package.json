@@ -1,0 +1,38 @@
+{
+  "name": "claude-code-team-sync",
+  "version": "1.0.0",
+  "description": "Share Claude Code sessions, notes and team context with coworkers through a git branch, a git repository or a synced folder (OneDrive, SharePoint, Teams, Google Drive, Dropbox).",
+  "type": "module",
+  "bin": {
+    "claude-team": "claude-team.mjs"
+  },
+  "files": [
+    "claude-team.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nrzz/claude-code-team-sync.git"
+  },
+  "homepage": "https://github.com/nrzz/claude-code-team-sync#readme",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "team",
+    "collaboration",
+    "pair-programming",
+    "sessions",
+    "handover",
+    "shared-context"
+  ],
+  "author": "Naresh Prabu",
+  "license": "MIT"
+}
