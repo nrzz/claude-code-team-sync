@@ -1,5 +1,7 @@
 # Claude Code team sync
 
+[![test](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml/badge.svg)](https://github.com/nrzz/claude-code-team-sync/actions/workflows/test.yml)
+
 Work on one project with your coworkers in Claude Code without starting from zero every time. Share the session you are in with one command, pick up a teammate's session where they left it, and give every new session the team's notes and decisions before anyone types a word.
 
 Each person keeps their own Claude seat (Team, Enterprise, Pro, Max or an API key). Nothing here shares a login. What travels is context.
@@ -125,9 +127,9 @@ Share sessions only with people who may see the code and data they touch.
 
 ## What was verified, and how
 
-Checked on 2026-10-03 on Windows 11 with Node 24 and git 2.55, against the transcript format of Claude Code 2.1.286:
+Checked on 2026-10-03 against the transcript format of Claude Code 2.1.286, on Windows 11 by hand and on Windows, macOS and Linux with Node 20, 22 and 24 in CI:
 
-- **31 automated tests** (`npm test`). Unit tests cover redaction (16 secret kinds caught, 8 look-alikes such as `password: string` and `PASSWORD=${DB_PASSWORD}` left alone), the project-folder naming rule, path placeholders both ways (Windows to macOS included), and transcript cleanup: every removed record is re-linked so the conversation chain stays whole, and ids and signatures are never rewritten.
+- **31 automated tests** (`npm test`), green on all nine OS and Node combinations. The first CI run caught a real bug that Windows alone could not show: on case-sensitive file systems, paths were left in shared transcripts. Fixed, and covered by a test. Unit tests cover redaction (16 secret kinds caught, 8 look-alikes such as `password: string` and `PASSWORD=${DB_PASSWORD}` left alone), the project-folder naming rule, path placeholders both ways (Windows to macOS included), and transcript cleanup: every removed record is re-linked so the conversation chain stays whole, and ids and signatures are never rewritten.
 - **End to end, three hub types.** Two people with separate Claude folders and a real local git remote: init creates the hub branch; a share from one person is published with nothing secret or private in it (checked by cloning the hub branch and searching every file, the compressed transcript included); the other person's first session start shows the digest with no setup; `/team-load`'s command finds the session by topic; `resume` rebuilds the transcript with the receiver's paths and no placeholder left; notes with quotes and symbols arrive from both sides; the next session start announces what is new. The same flow runs through a synced folder without git, and through an empty separate repository.
 - **Resilience.** An unreachable hub leaves the session-start hook silent and quick (exit code 0), and malformed hook input is ignored.
 
