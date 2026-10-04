@@ -10,8 +10,18 @@ import { projectSlug } from "../claude-team.mjs";
 
 export const CLI = fileURLToPath(new URL("../claude-team.mjs", import.meta.url));
 
+// Every folder made here is removed when the test process exits, so a run leaves nothing in the temp folder.
+const made = [];
+process.on("exit", () => {
+  for (const dir of made) {
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* a background sync may still hold a file; the OS cleans the temp folder later */ }
+  }
+});
+
 export function tmp(prefix = "ct-") {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  made.push(dir);
+  return dir;
 }
 
 // git isolated from the machine's own global and system config (credential helpers, hooks,
