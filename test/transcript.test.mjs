@@ -223,4 +223,8 @@ test("readable() and argument parsing", () => {
   assert.deepEqual(a, { _: ["abc"], title: "My title", brief: "-", "dry-run": true, to: "/x" });
   assert.equal(parseArgs(["--brief"]).brief, "-");
   assert.equal(parseArgs(["--brief", "notes.md"]).brief, "notes.md");
+  // A flag that takes a value but got none, or a flag that does not exist, is a clear error, not a crash later.
+  assert.throws(() => parseArgs(["--hub"]), /--hub needs a value/);
+  assert.throws(() => parseArgs(["--hub", "--yes"]), /--hub needs a value/);
+  assert.throws(() => parseArgs(["--yse"]), /--yse is not an option of claude-team/);
 });

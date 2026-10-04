@@ -33,7 +33,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.2.1";
 const SELF = fileURLToPath(import.meta.url);
 const IS_WIN = process.platform === "win32";
 const REPO_URL = "https://github.com/nrzz/claude-code-team-sync";
@@ -349,7 +349,7 @@ const HUB_README = `# Claude team hub
 
 Written by [claude-code-team-sync](${REPO_URL}). It holds the Claude Code sessions and notes that teammates shared, per project:
 
-- \`projects/<project>/TEAM.md\`: standing team context, shown to every new session. Keep it short; it is read on every session start.
+- \`projects/<project>/TEAM.md\`: standing team context, shown to each teammate's first session and again whenever it changes (to every session with \`claude-team auto digest full\`). Keep it short.
 - \`projects/<project>/notes/<person>.md\`: dated one-line team notes (\`/team-note\` or \`claude-team note "..."\`).
 - \`projects/<project>/sessions/<date>_<person>_<id>/\`: one shared session. \`brief.md\` first, then \`transcript.md\` (the condensed conversation), \`meta.json\`, and \`session.jsonl.gz\`, the redacted transcript that \`claude-team resume\` turns back into a Claude Code session.
 
@@ -467,7 +467,7 @@ export function readNotes(hub, key) {
 
 const TEAM_TEMPLATE = (project) => `# Team context: ${project}
 
-Shown to every teammate's new Claude Code session, so keep it short (it costs tokens on every session start). Edit freely; \`claude-team sync\` publishes your edit.
+Shown to each teammate's first Claude Code session and again whenever it changes (to every session with \`claude-team auto digest full\`), so keep it short: it costs tokens each time. Edit freely; \`claude-team sync\` publishes your edit.
 
 ## Conventions
 - (how we branch, test, format and review)
@@ -507,13 +507,16 @@ const SECRET_RULES = [
 // Label-and-value rules: group 1 (the label) is kept, group 2 (the value) is replaced.
 const VALUE_RULES = [
   ["bearer-token", /(\bBearer\s+)([A-Za-z0-9._~+/-]{20,}=*)/g],
-  ["url-password", /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/"'`]+:)([^\s@/"'`]+)(?=@)/gi],
+  ["url-password", /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/"'`]*:)([^\s@/"'`]+)(?=@)/gi],
   ["aws-secret", /(aws_secret_access_key["']?\s*[:=]\s*["']?)([A-Za-z0-9/+=]{40})/gi],
   ["azure-key", /((?:AccountKey|SharedAccessKey)\s*=\s*)([A-Za-z0-9+/=]{20,})/gi],
   ["connection-password", /((?:^|[;"'])\s*(?:Password|Pwd)=)([^;'"\s]{2,})/gim],
   ["env-secret", /^(\s*(?:export\s+)?[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*=\s*["']?)([^\s"'#]{4,})/gm],
-  ["assigned-secret", /(\b(?:password|passwd|secret|client_secret|api_?key|access_?token|auth_?token|refresh_?token)["']?\s*[:=]\s*["'])([^"'\s]{6,})(?=["'])/gi],
+  ["assigned-secret", /(\b(?:password|passwd|secret|client_secret|api_?key|access_?token|auth_?token|refresh_?token|token)["']?\s*[:=]\s*["'])([^"'\s]{6,})(?=["'])/gi],
 ];
+// A field whose name says it holds a secret (a tool's password or api_key input): its whole value is
+// replaced, because a value on its own does not look like a secret to the rules above.
+const SECRET_KEY = /^(?:.*[_-])?(?:password|passwd|pwd|secret|client_secret|secret_?key|token|api_?key|apikey|private_?key|access_?key|authorization|credentials?)$/i;
 const PLACEHOLDER_VALUE = /^(?:x+|\*+|\.+|changeme|change_me|password|secret|null|none|undefined|example[\w-]*|dummy[\w-]*|test\w{0,4}|your[\w-]*|<[^>]*>|\$\{[^}]*\}|\$[A-Z_]+|%[A-Z_]+%|\[REDACTED[^\]]*\]?)$/i;
 
 export function makeRedactor(extraPatterns = []) {
@@ -599,7 +602,7 @@ const STRIP_FIELDS = ["ownerAccountUuid", "ownerOrganizationUuid", "accountUuid"
 const SKIP_KEYS = new Set(["uuid", "parentUuid", "logicalParentUuid", "leafUuid", "sessionId", "requestId", "messageId", "promptId", "id", "tool_use_id", "signature", "timestamp", "sourceToolUseID", "sourceToolAssistantUUID", "agentId", "type", "role", "model", "version", "stop_reason", "media_type", "userType", "entrypoint"]);
 
 export function mapStrings(value, fn, key = "") {
-  if (typeof value === "string") return SKIP_KEYS.has(key) ? value : fn(value);
+  if (typeof value === "string") return SKIP_KEYS.has(key) ? value : fn(value, key);
   if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn, key));
   if (value && typeof value === "object") {
     if (value.type === "thinking" || value.type === "redacted_thinking") return value; // signed by the API
@@ -1147,7 +1150,13 @@ async function cmdShare(args, ctx) {
     root, roots: sameRoot ? [] : [otherRoot],
     slug: path.basename(path.dirname(file)), home: os.homedir(),
   });
-  const mapString = (s) => toPlaceholders(redact(s, redactCounts));
+  const mapString = (s, key = "") => {
+    if (key && SECRET_KEY.test(key) && s.trim().length >= 4 && !PLACEHOLDER_VALUE.test(s.trim())) {
+      redactCounts["named-secret"] = (redactCounts["named-secret"] || 0) + 1;
+      return "[REDACTED:named-secret]";
+    }
+    return toPlaceholders(redact(s, redactCounts));
+  };
   const { records, bad } = parseTranscript(fs.readFileSync(file, "utf8"));
   const { records: clean, stats } = sanitizeRecords(records, { mapString, keepThinking: !!args["keep-thinking"], keepImages: !!args["keep-images"] });
   const sum = summarize(clean);
@@ -1162,7 +1171,8 @@ async function cmdShare(args, ctx) {
     if (!ready.ok && !ready.offline) fail(`Hub problem: ${ready.error}`);
   }
   const existing = hubSessions(hub, pcfg.project).find((s) => s.meta.id === sessionId);
-  const title = oneLine(args.title || (existing && auto ? existing.meta.title : "") || info.title, 120);
+  // Redacted and mapped like the transcript: a title made from the first prompt can hold a key or a path.
+  const title = oneLine(mapString(args.title || (existing && auto ? existing.meta.title : "") || info.title), 120);
 
   let brief = "";
   if (args.brief === "-" || args.brief === true) brief = readStdin();
@@ -1483,11 +1493,21 @@ async function cmdAuto(args, ctx) {
     case "every":
       if (!(Number(value) >= 1)) fail("auto every takes a number of minutes, 1 or more");
       scope.syncMinutes = Number(value); break;
-    case "skip": case "unskip":
+    case "skip": case "unskip": {
       if (!sid) fail("Which session? Pass --session <id>. In Claude Code, /team-auto skip does it for the session you are in.");
-      updateSessionState(sid, { skip: what === "skip" }, env);
-      say(c.green("✓"), what === "skip" ? `Session ${sid.slice(0, 8)} will not be shared automatically.` : `Session ${sid.slice(0, 8)} follows your automatic sharing setting again.`);
+      // The short ids `claude-team sessions` prints are expanded the way `share` expands them, so the
+      // stored id is the full one the hooks look up.
+      let full = sid;
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid)) {
+        const ids = [...new Set(findLocalTranscripts(sid, env).map((f) => path.basename(f, ".jsonl")))];
+        if (!ids.length) fail(`No session on this machine starts with "${sid}". Use an id from claude-team sessions (at least 6 characters).`);
+        if (ids.length > 1) fail(`"${sid}" matches ${ids.length} sessions (${ids.map((x) => x.slice(0, 12)).join(", ")}); give more of the id.`);
+        full = ids[0];
+      }
+      updateSessionState(full, { skip: what === "skip" }, env);
+      say(c.green("✓"), what === "skip" ? `Session ${full.slice(0, 8)} will not be shared automatically.` : `Session ${full.slice(0, 8)} follows your automatic sharing setting again.`);
       return 0;
+    }
     default:
       fail(`Unknown setting "${what}". Try: auto live | auto end | auto off | auto sync on|off | auto notices notice|context|off | auto digest new|full|pointer|off | auto every <minutes> | auto skip`);
   }
@@ -1852,8 +1872,10 @@ function mergeProjectSettings(root, { auto = true } = {}) {
   const file = path.join(root, ".claude", "settings.json");
   let settings = {};
   if (exists(file)) {
-    settings = readJson(file, undefined);
-    if (settings === undefined) {
+    // A sentinel, not undefined: readJson's default parameter would turn undefined into null.
+    const INVALID = Symbol("invalid");
+    settings = readJson(file, INVALID);
+    if (settings === INVALID || !settings || typeof settings !== "object" || Array.isArray(settings)) {
       return `.claude/settings.json is not valid JSON, so it was left alone. Add this under "hooks" by hand:\n${JSON.stringify(mergeHookSettings({}, { auto }).hooks, null, 2)}`;
     }
   }
@@ -1866,6 +1888,7 @@ function mergeProjectSettings(root, { auto = true } = {}) {
 // ---------------------------------------------------------------------------------------------
 
 const BOOLEAN_FLAGS = new Set(["yes", "force", "last", "dry-run", "no-raw", "keep-thinking", "keep-images", "launch", "for-context", "full", "stdin", "help", "version", "path", "auto", "background", "once", "global", "no-auto"]);
+const VALUE_FLAGS = new Set(["hub", "name", "project", "folder", "title", "brief", "user", "to", "branch", "every", "limit", "session", "label", "dir", "budget"]);
 export function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -1874,11 +1897,13 @@ export function parseArgs(argv) {
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
       const key = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      if (!BOOLEAN_FLAGS.has(key) && !VALUE_FLAGS.has(key)) throw new UserError(`--${key} is not an option of claude-team. Run claude-team --help to see them.`);
       if (eq > 0) args[key] = a.slice(eq + 1);
       else if (BOOLEAN_FLAGS.has(key)) args[key] = true;
       else if (key === "brief" && (argv[i + 1] === undefined || argv[i + 1] === "-" || argv[i + 1].startsWith("--"))) { args.brief = "-"; if (argv[i + 1] === "-") i++; }
       else if (argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) args[key] = argv[++i];
-      else args[key] = true;
+      else if (VALUE_FLAGS.has(key)) throw new UserError(`--${key} needs a value.`);
+      else throw new UserError(`--${key} is not an option of claude-team. Run claude-team --help to see them.`);
     } else if (a === "-h") args.help = true;
     else args._.push(a);
   }
