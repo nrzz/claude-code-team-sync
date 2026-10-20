@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   projectSlug, makeRedactor, pathMapper, importMapper, parseTranscript, sanitizeRecords, summarize,
   renderTranscript, nextStepOf, trimMiddle, mergeHookSettings, mapStrings, readable, parseArgs, promptText,
+  parseSince,
 } from "../claude-team.mjs";
 import { tmp, writeFakeSession, SECRETS } from "./helpers.mjs";
 
@@ -223,8 +224,31 @@ test("readable() and argument parsing", () => {
   assert.deepEqual(a, { _: ["abc"], title: "My title", brief: "-", "dry-run": true, to: "/x" });
   assert.equal(parseArgs(["--brief"]).brief, "-");
   assert.equal(parseArgs(["--brief", "notes.md"]).brief, "notes.md");
+  assert.deepEqual(parseArgs(["list", "--since", "7d"]), { _: ["list"], since: "7d" });
+  assert.deepEqual(parseArgs(["search", "foo", "--since=2026-09-01"]), { _: ["search", "foo"], since: "2026-09-01" });
   // A flag that takes a value but got none, or a flag that does not exist, is a clear error, not a crash later.
   assert.throws(() => parseArgs(["--hub"]), /--hub needs a value/);
   assert.throws(() => parseArgs(["--hub", "--yes"]), /--hub needs a value/);
+  assert.throws(() => parseArgs(["--since"]), /--since needs a value/);
   assert.throws(() => parseArgs(["--yse"]), /--yse is not an option of claude-team/);
+});
+
+test("parseSince accepts relative hours, days and weeks, and dates as local midnight", () => {
+  const now = Date.parse("2026-10-20T12:00:00.000Z");
+  assert.equal(parseSince(undefined, now), null);
+  assert.equal(parseSince(null, now), null);
+  assert.equal(parseSince("", now), null);
+  assert.equal(parseSince("12h", now), now - 12 * 3600000);
+  assert.equal(parseSince("7d", now), now - 7 * 86400000);
+  assert.equal(parseSince("2w", now), now - 14 * 86400000);
+  assert.equal(parseSince("7D", now), now - 7 * 86400000);
+  assert.equal(parseSince("0d", now), now);
+  assert.equal(parseSince("2026-09-01", now), new Date(2026, 8, 1).getTime());
+  assert.equal(parseSince(" 2026-09-01 ", now), new Date(2026, 8, 1).getTime());
+});
+
+test("parseSince rejects invalid values", () => {
+  for (const bad of ["invalid", "7", "d", "7m", "7 days", "-7d", "1.5d", "2026-13-01", "2026-02-30", "2026/09/01", "yesterday"]) {
+    assert.throws(() => parseSince(bad), /--since needs a number of hours, days or weeks \(12h, 7d, 2w\) or a date \(YYYY-MM-DD\)/, JSON.stringify(bad));
+  }
 });

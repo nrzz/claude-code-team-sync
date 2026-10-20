@@ -115,6 +115,8 @@ To keep a hub in sync while Claude Code is closed, leave `claude-team watch` run
 claude-team sessions                  # your sessions in this project
 claude-team share --last              # share the newest one
 claude-team list                      # what the team shared
+claude-team list --since 7d           # only recent shares (or: 12h, 2w, YYYY-MM-DD)
+claude-team search "auth" --since 2026-09-01
 claude-team show login bug            # read a brief
 claude-team resume 403273f4           # continue a teammate's session as your own
 claude-team note "staging is frozen until Monday"
@@ -130,6 +132,12 @@ claude --resume "<the printed path to the .jsonl>" --fork-session
 ```
 
 Claude Code imports it as a new session of yours (`--fork-session` gives it a new id), with the whole conversation, every tool call and its result. Add `--launch` to start it straight away.
+
+| Option | Commands | Meaning |
+| --- | --- | --- |
+| `--since <when>` | `list`, `search` | Only sessions shared at or after that moment: hours, days or weeks back (`12h`, `7d`, `2w`) or a date (`YYYY-MM-DD`, local midnight) |
+| `--user <name>` | `list` | Filter shared sessions by author |
+| `--limit <n>` | `list`, `sessions` | How many sessions to show (default 20 for `list`, 15 for `sessions`) |
 
 ## What is shared, and what never leaves your machine
 
