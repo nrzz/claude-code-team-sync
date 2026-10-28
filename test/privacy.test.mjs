@@ -71,7 +71,7 @@ test("auto skip takes the short id that `sessions` prints, and that session is n
 });
 
 test("an option that does not exist is an error, with or without a value after it", () => {
-  assert.throws(() => parseArgs(["--since", "7d"]), /--since is not an option of claude-team/);
+  assert.throws(() => parseArgs(["--until", "7d"]), /--until is not an option of claude-team/);
   assert.throws(() => parseArgs(["--LIMIT", "3"]), /--LIMIT is not an option/);
   assert.deepEqual(parseArgs(["--limit", "3", "--yes"]), { _: [], limit: "3", yes: true });
 });

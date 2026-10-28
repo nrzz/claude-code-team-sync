@@ -109,6 +109,24 @@ function ago(iso) {
 }
 const firstLine = (s) => String(s || "").trim().split(/\r?\n/).filter(Boolean).pop() || "";
 const kb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+export function parseSince(value, now = Date.now()) {
+  if (value === undefined || value === null || value === "") return null;
+  const s = String(value).trim();
+  const rel = /^(\d+)\s*([hdw])$/i.exec(s);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = rel[2].toLowerCase();
+    const mult = unit === "h" ? 3600000 : unit === "d" ? 86400000 : 7 * 86400000;
+    return now - n * mult;
+  }
+  const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (date) {
+    const y = Number(date[1]), m = Number(date[2]), d = Number(date[3]);
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d) return dt.getTime();
+  }
+  fail(`--since needs a number of hours, days or weeks (12h, 7d, 2w) or a date (YYYY-MM-DD): "${value}"`);
+}
 function bump(counts, key, n = 1) { counts[key] = (counts[key] || 0) + n; }
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 function redactUrl(u) { return String(u || "").replace(/\/\/[^@/]*@/, "//"); }
@@ -987,8 +1005,9 @@ function syncOrWarn(hub, opts) {
   return r;
 }
 
-function findSharedSession(hub, key, ref) {
-  const sessions = hubSessions(hub, key);
+function findSharedSession(hub, key, ref, { since = null } = {}) {
+  let sessions = hubSessions(hub, key);
+  if (since !== null) sessions = sessions.filter((s) => s.meta && s.meta.sharedAt && Date.parse(s.meta.sharedAt) >= since);
   const q = String(ref || "").trim();
   if (!q) return { sessions, match: null, candidates: sessions.slice(0, 10) };
   const byId = sessions.filter((s) => s.meta.id === q || (/^[0-9a-f-]{4,}$/i.test(q) && s.meta.id.startsWith(q.toLowerCase())));
@@ -1259,9 +1278,11 @@ async function cmdSessions(args, ctx) {
 
 async function cmdList(args, ctx) {
   const { pcfg, hub } = requireProject(ctx.cwd, ctx.env);
+  const since = parseSince(args.since);
   syncOrWarn(hub, { timeout: 20000 });
   let sessions = hubSessions(hub, pcfg.project);
   if (args.user) sessions = sessions.filter((s) => s.meta.authorSlug === slugify(args.user, 40) || String(s.meta.author).toLowerCase() === String(args.user).toLowerCase());
+  if (since !== null) sessions = sessions.filter((s) => s.meta && s.meta.sharedAt && Date.parse(s.meta.sharedAt) >= since);
   if (!sessions.length) { say("Nobody has shared a session for this project yet. Share yours with /team-share in Claude Code."); return 0; }
   say(c.bold(`Shared sessions for ${pcfg.project}`), c.dim(`(${sessions.length})`));
   for (const s of sessions.slice(0, Number(args.limit) || 20)) say("  " + sessionLine(s));
@@ -1270,10 +1291,11 @@ async function cmdList(args, ctx) {
 
 async function cmdSearch(args, ctx) {
   const { pcfg, hub } = requireProject(ctx.cwd, ctx.env);
+  const since = parseSince(args.since);
   syncOrWarn(hub, { timeout: 20000 });
   const q = args._.join(" ");
   if (!q) fail("Give some words to search for.");
-  const { match, candidates } = findSharedSession(hub, pcfg.project, q);
+  const { match, candidates } = findSharedSession(hub, pcfg.project, q, { since });
   const hits = match ? [match] : candidates;
   if (!hits.length) { say(`Nothing shared matches "${q}".`); return 1; }
   for (const s of hits) say("  " + sessionLine(s));
@@ -1888,7 +1910,7 @@ function mergeProjectSettings(root, { auto = true } = {}) {
 // ---------------------------------------------------------------------------------------------
 
 const BOOLEAN_FLAGS = new Set(["yes", "force", "last", "dry-run", "no-raw", "keep-thinking", "keep-images", "launch", "for-context", "full", "stdin", "help", "version", "path", "auto", "background", "once", "global", "no-auto"]);
-const VALUE_FLAGS = new Set(["hub", "name", "project", "folder", "title", "brief", "user", "to", "branch", "every", "limit", "session", "label", "dir", "budget"]);
+const VALUE_FLAGS = new Set(["hub", "name", "project", "folder", "title", "brief", "user", "to", "branch", "every", "limit", "session", "label", "dir", "budget", "since"]);
 export function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -1920,8 +1942,8 @@ ${c.bold("Set up")} (one person per project, then commit the .claude/ files it w
 ${c.bold("Share and pick up")}
   claude-team sessions                     your local sessions in this project
   claude-team share [<id>|--last] [--title <t>] [--brief <file>|-] [--dry-run] [--no-raw]
-  claude-team list [--user <name>]         what the team shared
-  claude-team search <words>
+  claude-team list [--user <name>] [--since <when>]   what the team shared
+  claude-team search <words> [--since <when>]
   claude-team show <id|words> [--for-context] [--full]
   claude-team resume <id|words> [--launch] [--to <dir>]   continue a teammate's session
 

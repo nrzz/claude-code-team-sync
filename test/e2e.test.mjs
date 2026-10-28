@@ -119,8 +119,14 @@ test("branch hub: share, digest, load, resume and notes between two people", asy
     const list = runCli(["list"], { cwd: bRoot, env: bob.env, cli: VENDORED(bRoot) });
     assert.equal(list.code, 0, list.all);
     assert.match(list.out, /Fix login redirect loop/);
+    const listSince = runCli(["list", "--since", "7d"], { cwd: bRoot, env: bob.env, cli: VENDORED(bRoot) });
+    assert.equal(listSince.code, 0, listSince.all);
+    assert.match(listSince.out, /Fix login redirect loop/);
     const search = runCli(["search", "redirect", "loop"], { cwd: bRoot, env: bob.env, cli: VENDORED(bRoot) });
     assert.match(search.out, new RegExp(s.id.slice(0, 8)));
+    const searchSince = runCli(["search", "redirect", "--since", "7d"], { cwd: bRoot, env: bob.env, cli: VENDORED(bRoot) });
+    assert.equal(searchSince.code, 0, searchSince.all);
+    assert.match(searchSince.out, new RegExp(s.id.slice(0, 8)));
     const show = runCli(["show", "--for-context", "redirect loop"], { cwd: bRoot, env: bob.env, cli: VENDORED(bRoot) });
     assert.equal(show.code, 0, show.all);
     assert.match(show.out, /^<team-session id="/);
@@ -264,4 +270,94 @@ test("commands outside a set-up project explain what to do", () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /No team hub is set up/);
   assert.match(r.err, /npx -y github:nrzz\/claude-code-team-sync init/);
+});
+
+test("list and search filter shared sessions by --since", () => {
+  const base = tmp("ct-since-");
+  const shared = path.join(base, "hub");
+  const user = person(base, "Alice");
+  const root = path.join(base, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const init = runCli(["init", "--hub", shared, "--yes", "--project", "my-app"], { cwd: root, env: user.env });
+  assert.equal(init.code, 0, init.all);
+
+  const sessDir = path.join(shared, "projects", "my-app", "sessions");
+  // 1. Old session from 30 days ago
+  const oldDir = path.join(sessDir, "2026-08-01_alice_11111111");
+  fs.mkdirSync(oldDir, { recursive: true });
+  fs.writeFileSync(path.join(oldDir, "meta.json"), JSON.stringify({
+    id: "11111111-1111-4111-8111-111111111111",
+    project: "my-app",
+    title: "Old database migration",
+    author: "Alice",
+    authorSlug: "alice",
+    sharedAt: "2026-08-01T10:00:00.000Z",
+  }));
+  fs.writeFileSync(path.join(oldDir, "brief.md"), "Database migration details");
+  fs.writeFileSync(path.join(oldDir, "transcript.md"), "Old migration transcript");
+
+  // 2. Recent session from today
+  const recentDir = path.join(sessDir, "2026-10-20_alice_22222222");
+  fs.mkdirSync(recentDir, { recursive: true });
+  fs.writeFileSync(path.join(recentDir, "meta.json"), JSON.stringify({
+    id: "22222222-2222-4222-8222-222222222222",
+    project: "my-app",
+    title: "Recent authentication refactor",
+    author: "Alice",
+    authorSlug: "alice",
+    sharedAt: new Date().toISOString(),
+  }));
+  fs.writeFileSync(path.join(recentDir, "brief.md"), "Authentication refactor details");
+  fs.writeFileSync(path.join(recentDir, "transcript.md"), "Recent auth transcript");
+
+  // Default list shows both
+  const listAll = runCli(["list"], { cwd: root, env: user.env });
+  assert.equal(listAll.code, 0, listAll.all);
+  assert.match(listAll.out, /Recent authentication refactor/);
+  assert.match(listAll.out, /Old database migration/);
+
+  // --since 7d shows only recent
+  for (const since of ["7d", "12h", "2w", "--since=7d"]) {
+    const args = since.startsWith("--") ? ["list", since] : ["list", "--since", since];
+    const r = runCli(args, { cwd: root, env: user.env });
+    assert.equal(r.code, 0, r.all);
+    assert.match(r.out, /Recent authentication refactor/);
+    assert.ok(!r.out.includes("Old database migration"));
+  }
+
+  // --since with a date (local midnight)
+  const listDate = runCli(["list", "--since", "2026-09-01"], { cwd: root, env: user.env });
+  assert.equal(listDate.code, 0, listDate.all);
+  assert.match(listDate.out, /Recent authentication refactor/);
+  assert.ok(!listDate.out.includes("Old database migration"));
+
+  // --since far in the future
+  const listFuture = runCli(["list", "--since", "2099-01-01"], { cwd: root, env: user.env });
+  assert.equal(listFuture.code, 0, listFuture.all);
+  assert.match(listFuture.out, /Nobody has shared a session for this project yet/);
+
+  // search with --since
+  const searchOld = runCli(["search", "migration", "--since", "7d"], { cwd: root, env: user.env });
+  assert.equal(searchOld.code, 1);
+  assert.match(searchOld.out, /Nothing shared matches "migration"/);
+
+  const searchRecent = runCli(["search", "refactor", "--since", "7d"], { cwd: root, env: user.env });
+  assert.equal(searchRecent.code, 0, searchRecent.all);
+  assert.match(searchRecent.out, /Recent authentication refactor/);
+
+  // search with YYYY-MM-DD
+  const searchDate = runCli(["search", "migration", "--since", "2026-07-01"], { cwd: root, env: user.env });
+  assert.equal(searchDate.code, 0, searchDate.all);
+  assert.match(searchDate.out, /Old database migration/);
+
+  // Invalid --since produces exit code 1 with clear message
+  for (const bad of ["invalid", "7m", "yesterday", "2026-13-01"]) {
+    const rList = runCli(["list", "--since", bad], { cwd: root, env: user.env });
+    assert.equal(rList.code, 1, bad);
+    assert.match(rList.err, /--since needs a number of hours, days or weeks \(12h, 7d, 2w\) or a date \(YYYY-MM-DD\)/, bad);
+
+    const rSearch = runCli(["search", "foo", "--since", bad], { cwd: root, env: user.env });
+    assert.equal(rSearch.code, 1, bad);
+    assert.match(rSearch.err, /--since needs a number of hours, days or weeks \(12h, 7d, 2w\) or a date \(YYYY-MM-DD\)/, bad);
+  }
 });
