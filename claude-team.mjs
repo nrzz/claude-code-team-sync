@@ -33,7 +33,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "1.2.1";
+export const VERSION = "1.3.0";
 const SELF = fileURLToPath(import.meta.url);
 const IS_WIN = process.platform === "win32";
 const REPO_URL = "https://github.com/nrzz/claude-code-team-sync";
